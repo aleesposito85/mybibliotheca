@@ -1,3 +1,5 @@
+Please note: This Project is Currently NOT Maintained.
+
 # 📚 MyBibliotheca
 
 # 2.0.1+
