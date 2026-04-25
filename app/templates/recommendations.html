@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block title %}Discover - MyBibliotheca{% endblock %}
+
+{% block content %}
+<style>
+.recommendation-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 1rem;
+}
+@media (max-width: 768px) {
+  .recommendation-row {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    gap: 0.75rem;
+  }
+  .recommendation-row > * { scroll-snap-align: start; flex: 0 0 45%; }
+}
+.recommendation-card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-secondary, #fff);
+  border: 1px solid var(--border-soft, rgba(0,0,0,.08));
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+.recommendation-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0,0,0,.08);
+}
+.recommendation-card-cover img {
+  width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block;
+}
+.recommendation-card-body { padding: 0.5rem 0.75rem 0.75rem; }
+.recommendation-card-title { font-weight: 600; font-size: 0.95rem; line-height: 1.2; }
+.recommendation-card-author { font-size: 0.85rem; color: var(--text-color, #555); margin-top: 2px; }
+.recommendation-card-reason { font-size: 0.78rem; margin-top: 4px; }
+</style>
+
+<div class="container">
+  <h1 class="mb-3">Discover</h1>
+
+  {% if not personalized %}
+  <div class="alert alert-info" role="status">
+    Finish a couple of books to personalize this. Until then, here's what other
+    readers are loving.
+  </div>
+  {% endif %}
+
+  <section class="mb-4">
+    <h2 class="h4 mb-3">
+      {% if personalized %}Top picks for you{% else %}Popular among readers{% endif %}
+    </h2>
+    {% if top_picks %}
+      <div class="recommendation-row">
+        {% for book in top_picks %}
+          {% include "_recommendation_card.html" %}
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-muted">No recommendations yet — try adding a few books to your library.</p>
+    {% endif %}
+  </section>
+
+  {% if continue_series %}
+  <section class="mb-4">
+    <h2 class="h4 mb-3">Continue your series</h2>
+    <div class="recommendation-row">
+      {% for book in continue_series %}
+        {% include "_recommendation_card.html" %}
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <section class="mb-4">
+    <h2 class="h4 mb-3">Popular</h2>
+    {% if popular %}
+      <div class="recommendation-row">
+        {% for book in popular %}
+          {% with show_reason=False %}
+            {% include "_recommendation_card.html" %}
+          {% endwith %}
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="text-muted">Nothing to show yet.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

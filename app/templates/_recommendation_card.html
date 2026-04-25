@@ -1,0 +1,24 @@
+{# app/templates/_recommendation_card.html
+   Reusable recommendation card. Caller passes:
+     - book: dict with id, title, authors (list), cover_url, recommendation_reason
+     - show_reason: bool (default True) — hide on the library row for cleanliness
+#}
+{% set show_reason = show_reason if show_reason is defined else True %}
+{% set author = (book.authors[0] if book.authors and book.authors|length > 0 else "") %}
+<a class="recommendation-card" href="{{ url_for('book.view_book_enhanced', uid=book.id) }}"
+   aria-label="Recommendation: {{ book.title|e }}{% if author %} by {{ author|e }}{% endif %}{% if book.recommendation_reason %}. {{ book.recommendation_reason|e }}{% endif %}">
+  <div class="recommendation-card-cover">
+    <img src="{{ book.cover_url or '/static/bookshelf.png' }}"
+         alt="" loading="lazy"
+         onerror="this.src='/static/bookshelf.png'">
+  </div>
+  <div class="recommendation-card-body">
+    <div class="recommendation-card-title">{{ book.title }}</div>
+    {% if author %}
+    <div class="recommendation-card-author">{{ author }}</div>
+    {% endif %}
+    {% if show_reason and book.recommendation_reason %}
+    <div class="recommendation-card-reason text-muted small">{{ book.recommendation_reason }}</div>
+    {% endif %}
+  </div>
+</a>
