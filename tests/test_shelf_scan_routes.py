@@ -39,7 +39,7 @@ def _mock_svc(**methods):
     svc = MagicMock()
     for name, spec in methods.items():
         m = getattr(svc, name)
-        if isinstance(spec, dict):
+        if isinstance(spec, dict) and ("return_value" in spec or "side_effect" in spec):
             if "return_value" in spec:
                 m.return_value = spec["return_value"]
             if "side_effect" in spec:
