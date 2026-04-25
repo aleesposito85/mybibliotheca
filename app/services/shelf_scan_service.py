@@ -400,3 +400,161 @@ class ShelfScanService:
         items = [(d, f"det_{i + 1:03d}") for i, d in enumerate(detections)]
         with ThreadPoolExecutor(max_workers=ENRICHMENT_WORKERS) as ex:
             return list(ex.map(lambda pair: self._enrich_one(pair[0], pair[1]), items))
+
+
+# ---- AI config + orchestrator import ------------------------------------
+
+import uuid
+
+from app.services.ai_service import AIService
+
+
+def _load_ai_config() -> Dict[str, str]:
+    """Build the config dict AIService expects from env / app config."""
+    # Mirror the env-driven config used by other AIService callers
+    # (admin.load_ai_config does similar work). Kept local so we don't need
+    # to import admin (which has heavier deps).
+    return {
+        "AI_PROVIDER": os.environ.get("AI_PROVIDER", "ollama"),
+        "OLLAMA_BASE_URL": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "OLLAMA_MODEL": os.environ.get("OLLAMA_MODEL", "llama3.2-vision"),
+        "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", ""),
+        "OPENAI_MODEL": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        "OPENAI_BASE_URL": os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        "AI_FALLBACK_ENABLED": os.environ.get("AI_FALLBACK_ENABLED", "true"),
+        "AI_TIMEOUT": os.environ.get("AI_TIMEOUT", "60"),
+        "AI_MAX_TOKENS": os.environ.get("AI_MAX_TOKENS", "1500"),
+        "AI_TEMPERATURE": os.environ.get("AI_TEMPERATURE", "0.1"),
+    }
+
+
+# Append new methods to ShelfScanService after the class definition via
+# direct assignment so the class remains in one logical block.
+
+def _user_owned_book_titles(self, user_id: str) -> set:
+    """Return the set of {isbn13|isbn10} the user already owns.
+
+    We use ISBNs because they're the only stable join key — comparing
+    titles is fragile across editions.
+    """
+    try:
+        from app.infrastructure.kuzu_graph import safe_execute_kuzu_query
+        result = safe_execute_kuzu_query(
+            "MATCH (u:User {id: $uid})-[:HAS_PERSONAL_METADATA]->(b:Book) "
+            "RETURN b.isbn13 AS isbn13, b.isbn10 AS isbn10",
+            {"uid": user_id},
+            user_id=user_id,
+            operation="shelf_scan_owned",
+        )
+        owned: set = set()
+        if result is None:
+            return owned
+        has_next = getattr(result, "has_next", None)
+        get_next = getattr(result, "get_next", None)
+        if callable(has_next) and callable(get_next):
+            while result.has_next():
+                row = result.get_next()
+                if row[0]:
+                    owned.add(str(row[0]))
+                if row[1]:
+                    owned.add(str(row[1]))
+        return owned
+    except Exception:
+        logger.exception("shelf_scan: failed to fetch owned ISBNs")
+        return set()
+
+
+def scan_image_and_enrich_sync(
+    self,
+    image_bytes: bytes,
+    user_id: str,
+    original_filename: str,
+) -> Dict[str, Any]:
+    """End-to-end synchronous scan + enrichment. Returns a dict with
+    ``{scan_id, candidates, summary, preview_url}``.
+
+    Raises:
+        ShelfScanRateLimited — over the daily cap
+        ShelfScanInProgress — concurrent scan in flight
+        ShelfScanLLMUnavailable — no provider or all providers failed
+        ShelfScanEmptyResult — LLM returned 0 spines
+    """
+    t_total = time.perf_counter()
+
+    # 1. Pre-flight: rate limit + in-flight gate.
+    self._record_scan_for_rate_limit(user_id)
+    self._mark_scan_in_flight(user_id)
+    try:
+        # 2. AI provider must be configured.
+        ai = AIService(_load_ai_config())
+        if not ai.is_configured():
+            raise ShelfScanLLMUnavailable("No AI provider configured")
+
+        # 3. Allocate a scan_id up front so the preview path is stable.
+        scan_id = uuid.uuid4().hex
+
+        # 4. Preprocess (validate + resize + write preview file).
+        t_pre = time.perf_counter()
+        resized_bytes, preview_url = self._preprocess(image_bytes, original_filename, scan_id)
+        preprocess_ms = int((time.perf_counter() - t_pre) * 1000)
+
+        # 5. Vision LLM call.
+        t_llm = time.perf_counter()
+        detections = ai.extract_books_from_shelf_image(resized_bytes)
+        llm_ms = int((time.perf_counter() - t_llm) * 1000)
+
+        if not detections:
+            raise ShelfScanEmptyResult(preview_url=preview_url)
+
+        # 6. Parallel enrichment.
+        t_en = time.perf_counter()
+        enriched = self._enrich_many(detections)
+        enrich_ms = int((time.perf_counter() - t_en) * 1000)
+
+        # 7. Filter already-owned books.
+        owned_isbns = self._user_owned_book_titles(user_id)
+        already_owned_count = 0
+        kept: List[Dict[str, Any]] = []
+        for c in enriched:
+            if c.get("matched"):
+                bm = c.get("best_match") or {}
+                isbn13 = bm.get("isbn13")
+                isbn10 = bm.get("isbn10")
+                if (isbn13 and isbn13 in owned_isbns) or (isbn10 and isbn10 in owned_isbns):
+                    already_owned_count += 1
+                    continue
+            kept.append(c)
+
+        summary = {
+            "detected": len(detections),
+            "matched": sum(1 for c in kept if c.get("matched")),
+            "already_owned": already_owned_count,
+            "unmatched": sum(1 for c in kept if not c.get("matched")),
+        }
+
+        # 8. Persist for /confirm.
+        self._save_scan(scan_id, user_id, kept, preview_url=preview_url, summary=summary)
+
+        total_ms = int((time.perf_counter() - t_total) * 1000)
+        logger.info(
+            "[shelf_scan] user=%s provider=%s detected=%s matched=%s "
+            "already_owned=%s unmatched=%s preprocess_ms=%s llm_ms=%s "
+            "enrich_ms=%s total_ms=%s",
+            user_id, ai.provider, summary["detected"], summary["matched"],
+            summary["already_owned"], summary["unmatched"],
+            preprocess_ms, llm_ms, enrich_ms, total_ms,
+        )
+
+        return {
+            "scan_id": scan_id,
+            "candidates": kept,
+            "summary": summary,
+            "preview_url": preview_url,
+        }
+    finally:
+        self._clear_scan_in_flight(user_id)
+
+
+# Patch the two new methods onto the class (avoids restructuring the file).
+ShelfScanService._user_owned_book_titles = _user_owned_book_titles
+ShelfScanService.scan_image_and_enrich_sync = scan_image_and_enrich_sync

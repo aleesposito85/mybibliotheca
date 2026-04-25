@@ -198,3 +198,122 @@ def test_enrich_one_caps_alternatives_at_4(service):
     with patch("app.services.shelf_scan_service.fetch_unified_by_title", return_value=fake):
         candidate = service._enrich_one(detection, detection_id="d")
     assert len(candidate["alternatives"]) == 4
+
+
+# ---- Task 8: scan_image_and_enrich_sync orchestrator ---------------------
+
+from app.services.shelf_scan_service import (
+    ShelfScanLLMUnavailable,
+    ShelfScanEmptyResult,
+)
+
+
+def _detect(title, author="", spine=1, conf="high"):
+    return {"title": title, "author": author, "spine_position": spine, "confidence": conf}
+
+
+def _meta(title, isbn13, score=0.95):
+    return [{"title": title, "authors": ["X"], "isbn13": isbn13, "isbn10": None,
+             "cover_url": "", "published_date": "", "page_count": None,
+             "language": "en", "description": "", "similarity_score": score}]
+
+
+def test_scan_happy_path(kuzu_seeded, service, tmp_path):
+    _, ids = kuzu_seeded
+    with patch.object(service, "_uploads_dir", return_value=str(tmp_path)), \
+         patch("app.services.shelf_scan_service.AIService") as AICls, \
+         patch("app.services.shelf_scan_service.fetch_unified_by_title") as ft:
+        AICls.return_value.is_configured.return_value = True
+        AICls.return_value.extract_books_from_shelf_image.return_value = [
+            _detect("Dune", "Frank Herbert", 1),
+            _detect("Foundation", "Isaac Asimov", 2),
+        ]
+        ft.side_effect = [
+            _meta("Dune", "9780441172719"),
+            _meta("Foundation", "9780553293357"),
+        ]
+        result = service.scan_image_and_enrich_sync(
+            image_bytes=_make_jpeg(800, 600),
+            user_id=ids["user_newbie"],     # newbie has no books → nothing filtered
+            original_filename="shelf.jpg",
+        )
+    assert result["scan_id"]
+    assert len(result["candidates"]) == 2
+    assert result["summary"]["detected"] == 2
+    assert result["summary"]["matched"] == 2
+
+
+def test_scan_filters_already_owned(kuzu_seeded, service, tmp_path):
+    _, ids = kuzu_seeded
+    with patch.object(service, "_uploads_dir", return_value=str(tmp_path)), \
+         patch("app.services.shelf_scan_service.AIService") as AICls, \
+         patch("app.services.shelf_scan_service.fetch_unified_by_title") as ft, \
+         patch.object(service, "_user_owned_book_titles") as owned:
+        AICls.return_value.is_configured.return_value = True
+        AICls.return_value.extract_books_from_shelf_image.return_value = [
+            _detect("Dune", "Frank Herbert", 1),
+            _detect("Foundation", "Isaac Asimov", 2),
+        ]
+        ft.side_effect = [
+            _meta("Dune", "9780441172719"),
+            _meta("Foundation", "9780553293357"),
+        ]
+        # Alice already owns Dune in our fixture; mark its isbn as owned.
+        owned.return_value = {"9780441172719"}
+        result = service.scan_image_and_enrich_sync(
+            image_bytes=_make_jpeg(800, 600),
+            user_id=ids["user_alice"],
+            original_filename="shelf.jpg",
+        )
+    titles = [c["best_match"]["title"] for c in result["candidates"] if c.get("best_match")]
+    assert "Dune" not in titles
+    assert "Foundation" in titles
+    assert result["summary"]["already_owned"] == 1
+
+
+def test_scan_raises_when_llm_unconfigured(kuzu_seeded, service, tmp_path):
+    _, ids = kuzu_seeded
+    with patch.object(service, "_uploads_dir", return_value=str(tmp_path)), \
+         patch("app.services.shelf_scan_service.AIService") as AICls:
+        AICls.return_value.is_configured.return_value = False
+        with pytest.raises(ShelfScanLLMUnavailable):
+            service.scan_image_and_enrich_sync(
+                image_bytes=_make_jpeg(400, 300),
+                user_id=ids["user_alice"],
+                original_filename="shelf.jpg",
+            )
+
+
+def test_scan_raises_when_no_books_detected(kuzu_seeded, service, tmp_path):
+    _, ids = kuzu_seeded
+    with patch.object(service, "_uploads_dir", return_value=str(tmp_path)), \
+         patch("app.services.shelf_scan_service.AIService") as AICls:
+        AICls.return_value.is_configured.return_value = True
+        AICls.return_value.extract_books_from_shelf_image.return_value = []
+        with pytest.raises(ShelfScanEmptyResult) as e:
+            service.scan_image_and_enrich_sync(
+                image_bytes=_make_jpeg(400, 300),
+                user_id=ids["user_alice"],
+                original_filename="shelf.jpg",
+            )
+        # Error carries a preview URL so the upload page can re-render with it.
+        assert e.value.preview_url.startswith("/uploads/scans/")
+
+
+def test_scan_id_isolation_between_users(kuzu_seeded, service, tmp_path):
+    _, ids = kuzu_seeded
+    with patch.object(service, "_uploads_dir", return_value=str(tmp_path)), \
+         patch("app.services.shelf_scan_service.AIService") as AICls, \
+         patch("app.services.shelf_scan_service.fetch_unified_by_title") as ft:
+        AICls.return_value.is_configured.return_value = True
+        AICls.return_value.extract_books_from_shelf_image.return_value = [_detect("X")]
+        ft.return_value = _meta("X", "1")
+        result = service.scan_image_and_enrich_sync(
+            image_bytes=_make_jpeg(400, 300),
+            user_id=ids["user_alice"],
+            original_filename="shelf.jpg",
+        )
+    # Bob can't fetch alice's scan.
+    assert service.get_scan(result["scan_id"], ids["user_bob"]) is None
+    # Alice can.
+    assert service.get_scan(result["scan_id"], ids["user_alice"]) is not None
