@@ -22,3 +22,66 @@ def test_count_finished_books_alice(kuzu_seeded):
 
 def test_count_finished_books_unknown_user(kuzu_seeded):
     assert _count_finished_books("does-not-exist") == 0
+
+
+from app.services.kuzu_recommendation_service import (
+    _signal_shared_authors,
+    _signal_shared_categories,
+    _signal_same_series,
+    _signal_coreaders,
+    _signal_language_match,
+)
+
+
+def test_shared_authors_includes_other_books_by_same_author(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _signal_shared_authors([ids["book_dune"]])
+    # Dune is by Herbert; Dune Messiah and Children of Dune share him.
+    assert ids["book_dune2"] in out
+    assert ids["book_dune3"] in out
+    # Foundation (Asimov) does not share author.
+    assert ids["book_foundation"] not in out
+    # Anchor itself is excluded.
+    assert ids["book_dune"] not in out
+
+
+def test_shared_categories_counts_overlap(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _signal_shared_categories([ids["book_dune"]])
+    # dune has [sci_fi, space_opera]; dune2 has [sci_fi, space_opera] -> 2
+    assert out[ids["book_dune2"]]["count"] >= 2
+
+
+def test_same_series_marks_next_volume(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _signal_same_series(ids["book_dune"])
+    # Dune is volume 1; volume 2 (Messiah) should be flagged next.
+    assert out[ids["book_dune2"]]["next_volume"] is True
+    assert out[ids["book_dune2"]]["volume_number"] == 2
+    # Volume 3 is in the same series but not the immediate next.
+    assert out[ids["book_dune3"]]["next_volume"] is False
+
+
+def test_coreaders_threshold_floor(kuzu_seeded):
+    _, ids = kuzu_seeded
+    # Foundation was finished by alice, bob, carol → 3 distinct readers,
+    # which IS >= threshold for the raw query (filtering happens in the
+    # scorer, but the query itself returns the count).
+    out = _signal_coreaders([ids["book_foundation"]])
+    # Books read by anyone who also read Foundation:
+    assert ids["book_dune"] in out
+    # Self-anchor must be excluded.
+    assert ids["book_foundation"] not in out
+
+
+def test_language_match(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _signal_language_match([ids["book_dune"]], candidate_pool={
+        ids["book_dune2"], ids["book_foundation"], ids["book_storm1"],
+    })
+    # All seed books are 'en' so all candidates match.
+    assert out == {
+        ids["book_dune2"]: True,
+        ids["book_foundation"]: True,
+        ids["book_storm1"]: True,
+    }

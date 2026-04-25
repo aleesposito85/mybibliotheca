@@ -269,6 +269,189 @@ def _count_finished_books(user_id: str) -> int:
     return n
 
 
+# ----- Per-signal queries ---------------------------------------------
+
+def _signal_shared_authors(anchors: List[str]) -> Dict[str, Dict[str, Any]]:
+    """For each candidate, count distinct authors shared with any anchor.
+
+    Also surfaces the most-overlapping author's name for use in the
+    recommendation_reason.
+    """
+    if not anchors:
+        return {}
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (a:Book) WHERE a.id IN $anchors "
+            "MATCH (a)<-[:AUTHORED]-(p:Person)-[:AUTHORED]->(c:Book) "
+            "WHERE c.id <> a.id "
+            "RETURN c.id AS book_id, p.name AS author_name, count(DISTINCT a) AS overlap",
+            {"anchors": list(anchors)},
+            operation="recs_signal_authors",
+        )
+    except Exception:
+        logger.exception("recs: shared_authors signal failed")
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _result_to_rows(result):
+        bid = row.get("book_id")
+        if not bid:
+            continue
+        entry = out.setdefault(bid, {"count": 0, "top_author_name": None, "_top_overlap": 0})
+        entry["count"] += 1
+        overlap = int(row.get("overlap") or 0)
+        if overlap > entry["_top_overlap"]:
+            entry["_top_overlap"] = overlap
+            entry["top_author_name"] = row.get("author_name")
+    return out
+
+
+def _signal_shared_categories(anchors: List[str]) -> Dict[str, Dict[str, Any]]:
+    """For each candidate, count distinct categories shared with any anchor.
+
+    Groups by candidate book only so ``count`` reflects the true number of
+    overlapping categories. The collected names list also gives us a
+    representative label for the reason string without a second query.
+
+    KuzuDB gotcha: ``RETURN c.id, cat.name, count(DISTINCT cat)`` groups by
+    *all* non-aggregate columns, yielding count=1 per row. We must group by
+    ``c.id`` alone and use ``collect(DISTINCT cat.name)`` instead.
+    """
+    if not anchors:
+        return {}
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (a:Book) WHERE a.id IN $anchors "
+            "MATCH (a)-[:CATEGORIZED_AS]->(cat:Category)<-[:CATEGORIZED_AS]-(c:Book) "
+            "WHERE c.id <> a.id "
+            "RETURN c.id AS book_id, collect(DISTINCT cat.name) AS cats",
+            {"anchors": list(anchors)},
+            operation="recs_signal_categories",
+        )
+    except Exception:
+        logger.exception("recs: shared_categories signal failed")
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _result_to_rows(result):
+        bid = row.get("book_id")
+        if not bid:
+            continue
+        cats = row.get("cats") or []
+        out[bid] = {
+            "count": len(cats),
+            "top_category_name": cats[0] if cats else None,
+        }
+    return out
+
+
+def _signal_same_series(anchor_id: str) -> Dict[str, Dict[str, Any]]:
+    """Single-anchor signal: candidates in the same series as the anchor.
+
+    Marks ``next_volume = True`` when the candidate's volume_number is
+    exactly anchor.volume_number + 1.
+    """
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (a:Book {id: $anchor})-[ar:PART_OF_SERIES]->(s:Series) "
+            "MATCH (s)<-[cr:PART_OF_SERIES]-(c:Book) "
+            "WHERE c.id <> a.id "
+            "RETURN c.id AS book_id, s.name AS series_name, "
+            "       cr.volume_number AS volume_number, ar.volume_number AS anchor_volume",
+            {"anchor": anchor_id},
+            operation="recs_signal_series",
+        )
+    except Exception:
+        logger.exception("recs: same_series signal failed")
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _result_to_rows(result):
+        bid = row.get("book_id")
+        if not bid:
+            continue
+        cand_vol = row.get("volume_number")
+        anchor_vol = row.get("anchor_volume")
+        is_next = (
+            cand_vol is not None
+            and anchor_vol is not None
+            and int(cand_vol) == int(anchor_vol) + 1
+        )
+        out[bid] = {
+            "count": 1,
+            "series_name": row.get("series_name"),
+            "volume_number": int(cand_vol) if cand_vol is not None else None,
+            "next_volume": is_next,
+        }
+    return out
+
+
+def _signal_coreaders(anchors: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate co-reader signal.
+
+    Returns ``{candidate_id: {count, anchor_id}}`` where ``count`` is the
+    number of distinct users who finished both the anchor and the candidate.
+    The privacy-floor check (``count >= COREADER_MIN_THRESHOLD``) happens in
+    the scorer, not here, so the test fixture (3 readers) is observable.
+    """
+    if not anchors:
+        return {}
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (a:Book) WHERE a.id IN $anchors "
+            "MATCH (a)<-[m1:HAS_PERSONAL_METADATA]-(u:User)-[m2:HAS_PERSONAL_METADATA]->(c:Book) "
+            "WHERE m1.finish_date IS NOT NULL AND m2.finish_date IS NOT NULL "
+            "  AND c.id <> a.id "
+            "RETURN c.id AS book_id, a.id AS anchor_id, count(DISTINCT u) AS n",
+            {"anchors": list(anchors)},
+            operation="recs_signal_coreaders",
+        )
+    except Exception:
+        logger.exception("recs: coreaders signal failed")
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in _result_to_rows(result):
+        bid = row.get("book_id")
+        if not bid:
+            continue
+        n = int(row.get("n") or 0)
+        existing = out.get(bid)
+        if not existing or n > existing["count"]:
+            out[bid] = {"count": n, "anchor_id": row.get("anchor_id")}
+    return out
+
+
+def _signal_language_match(anchors: List[str], candidate_pool: Iterable[str]) -> Dict[str, bool]:
+    """Mark candidates whose language matches any anchor's language.
+
+    Cheap and computed last so we only check the pool the other signals
+    already produced. Returns ``{candidate_id: True}`` when there's a match;
+    candidates not in the result map have no language bonus.
+    """
+    pool = list(set(candidate_pool))
+    if not anchors or not pool:
+        return {}
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (a:Book) WHERE a.id IN $anchors RETURN DISTINCT a.language AS lang",
+            {"anchors": list(anchors)},
+            operation="recs_signal_lang_anchor",
+        )
+        anchor_langs = {r.get("lang") for r in _result_to_rows(result) if r.get("lang")}
+        if not anchor_langs:
+            return {}
+        result = safe_execute_kuzu_query(
+            "MATCH (b:Book) WHERE b.id IN $pool RETURN b.id AS book_id, b.language AS lang",
+            {"pool": pool},
+            operation="recs_signal_lang_pool",
+        )
+        return {
+            row["book_id"]: True
+            for row in _result_to_rows(result)
+            if row.get("book_id") and row.get("lang") in anchor_langs
+        }
+    except Exception:
+        logger.exception("recs: language_match signal failed")
+        return {}
+
+
 # ----- Service skeleton ------------------------------------------------
 
 class KuzuRecommendationService:
