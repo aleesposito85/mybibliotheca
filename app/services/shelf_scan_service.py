@@ -520,7 +520,13 @@ def scan_image_and_enrich_sync(
     self._mark_scan_in_flight(user_id)
     try:
         # 2. AI provider must be configured.
-        ai = AIService(_load_ai_config())
+        # Override AI_TIMEOUT for shelf scan: vision inference on a multi-
+        # book photo realistically needs 60-180s (cold model load + decode +
+        # generation), versus 30s default tuned for single-cover extraction.
+        # Override via env: SHELF_SCAN_AI_TIMEOUT (default 180).
+        ai_cfg = _load_ai_config()
+        ai_cfg["AI_TIMEOUT"] = os.environ.get("SHELF_SCAN_AI_TIMEOUT", "180")
+        ai = AIService(ai_cfg)
         if not ai.is_configured():
             raise ShelfScanLLMUnavailable("No AI provider configured")
 
