@@ -24,12 +24,15 @@ def restore_cover(book_id: str, cover_filename: str):
     cover_url = f'/covers/{cover_filename}'
     
     try:
-        result = db.connection.execute(f'''
-            MATCH (b:Book) 
-            WHERE b.id = '{book_id}'
-            SET b.cover_url = '{cover_url}'
+        result = db.connection.execute(
+            '''
+            MATCH (b:Book)
+            WHERE b.id = $book_id
+            SET b.cover_url = $cover_url
             RETURN b.title, b.cover_url
-        ''')
+            ''',
+            {"book_id": book_id, "cover_url": cover_url},
+        )
         updated = result.get_all()
         
         if updated:

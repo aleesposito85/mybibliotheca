@@ -1122,7 +1122,11 @@
     position: fixed;
     inset: 0;
     pointer-events: none;
-    z-index: 0;
+    /* Sit behind the page content. Previously z-index: 0 paired with
+       .overlay { z-index: 1 } trapped Bootstrap modals (z-index 1055)
+       inside .overlay's stacking context — the modal-backdrop, appended to
+       <body>, ended up above the modal content and intercepted clicks. */
+    z-index: -1;
   }
 
   body::before {
@@ -1140,8 +1144,8 @@
   }
 
   .overlay {
-    position: relative;
-    z-index: 1;
+    /* No z-index here on purpose: it would create a stacking context that
+       traps descendant Bootstrap modals below the body-level backdrop. */
     min-height: calc(100vh - (clamp(12px, 2vw, 32px) * 2));
     display: flex;
     flex-direction: column;
@@ -2640,5 +2644,25 @@
   {% block extra_modals %}{% endblock %}
   {# Injection point for page-specific scripts that must run after global utilities #}
   {% block scripts %}{% endblock %}
+  <script>
+    // Bootstrap modals must live in the root stacking context. Some pages
+    // place .modal markup inside .container, which has backdrop-filter and
+    // therefore creates a containing block for position:fixed descendants —
+    // that resizes the modal to the container's bounds and pushes it
+    // off-screen, leaving the user trapped behind the backdrop. Re-parent
+    // every .modal to <body> at load time to dodge that.
+    (function relocateModalsToBody() {
+      try {
+        var modals = document.querySelectorAll('.modal');
+        for (var i = 0; i < modals.length; i++) {
+          if (modals[i].parentElement !== document.body) {
+            document.body.appendChild(modals[i]);
+          }
+        }
+      } catch (e) {
+        console.warn('Modal relocation failed:', e);
+      }
+    })();
+  </script>
 </body>
 </html>

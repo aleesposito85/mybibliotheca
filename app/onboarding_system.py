@@ -325,21 +325,24 @@ def admin_setup_step():
             try:
                 logger.info(f"🔍 ONBOARDING DEBUG: Form processing, using form data directly")
                 
-                # Use form data directly if form validation failed but data is present
+                # Hash the password immediately so the plaintext never lands in
+                # the filesystem-backed Flask session between onboarding steps.
                 if form_valid:
-                    admin_data = {
-                        'username': form.username.data,
-                        'email': form.email.data,
-                        'password': form.password.data
-                    }
+                    raw_username = form.username.data
+                    raw_email = form.email.data
+                    raw_password = form.password.data
                 else:
-                    # Use raw form data
-                    admin_data = {
-                        'username': username,
-                        'email': email,
-                        'password': password
-                    }
-                
+                    raw_username = username
+                    raw_email = email
+                    raw_password = password
+                admin_data = {
+                    'username': raw_username,
+                    'email': raw_email,
+                    'password_hash': generate_password_hash(raw_password)
+                }
+                # Best-effort: scrub the local plaintext copies once hashed.
+                raw_password = None
+
                 logger.info(f"🔍 ONBOARDING DEBUG: Saving admin data: {admin_data['username']}, {admin_data['email']}")
                 
                 
@@ -1443,11 +1446,28 @@ def import_progress_json(task_id: str):
 def execute_onboarding(onboarding_data: Dict) -> bool:
     """Execute the complete onboarding configuration."""
     try:
+        # Re-check that no users exist before creating the admin — a stale
+        # session could otherwise replay onboarding after setup completed and
+        # add an extra admin account.
+        try:
+            existing_count = user_service.get_user_count_sync()
+        except Exception:
+            existing_count = None
+        if existing_count and existing_count > 0:
+            logger.warning("Refusing to execute onboarding: %s user(s) already exist", existing_count)
+            return False
+
         # Step 1: Create admin user
         admin_data = onboarding_data.get('admin', {})
         site_config = onboarding_data.get('site_config', {})
-        password_hash = generate_password_hash(admin_data['password'])
-        
+        # Hash was pre-computed in step 1 to avoid storing plaintext in session.
+        # Fall back to legacy plaintext field for in-flight upgrades.
+        password_hash = admin_data.get('password_hash')
+        if not password_hash and admin_data.get('password'):
+            password_hash = generate_password_hash(admin_data['password'])
+        if not password_hash:
+            raise ValueError("Admin password not configured during onboarding")
+
         display_name = admin_data.get('display_name') or admin_data['username']
         try:
             # Simple beautify: if username looks like random id (hex-ish), fall back to 'Admin'
@@ -1843,15 +1863,19 @@ def execute_onboarding_setup_only(onboarding_data: Dict) -> bool:
         print(f"🚀 [SETUP] Admin data keys: {list(admin_data.keys())}")
         print(f"🚀 [SETUP] Username: {admin_data.get('username')}")
         print(f"🚀 [SETUP] Email: {admin_data.get('email')}")
-        print(f"🚀 [SETUP] Has password: {bool(admin_data.get('password'))}")
+        print(f"🚀 [SETUP] Has password hash: {bool(admin_data.get('password_hash') or admin_data.get('password'))}")
         print(f"🚀 [SETUP] Site config: {site_config}")
         logger.info(f"Creating admin user: {admin_data.get('username')} with email: {admin_data.get('email')}")
-        
+
         try:
-            password_hash = generate_password_hash(admin_data['password'])
-            print(f"🚀 [SETUP] Password hash generated successfully")
+            password_hash = admin_data.get('password_hash')
+            if not password_hash and admin_data.get('password'):
+                password_hash = generate_password_hash(admin_data['password'])
+            if not password_hash:
+                raise ValueError("admin password missing")
+            print(f"🚀 [SETUP] Password hash present")
         except Exception as hash_error:
-            logger.error(f"Failed to generate password hash: {hash_error}")
+            logger.error(f"Failed to obtain password hash: {hash_error}")
             return False
         
         try:
@@ -2181,7 +2205,8 @@ def handle_onboarding_completion(onboarding_data: Dict):
         admin_data = onboarding_data.get('admin', {})
         admin_username = admin_data.get('username', 'UNKNOWN')
         print(f"🎉 [COMPLETION] Looking for admin user: {admin_username}")
-        print(f"🎉 [COMPLETION] Admin data: {admin_data}")
+        # Never print full admin_data — it has historically contained password material.
+        print(f"🎉 [COMPLETION] Admin data keys: {list(admin_data.keys())}")
         
         # Add debugging: let's see what users actually exist
         try:

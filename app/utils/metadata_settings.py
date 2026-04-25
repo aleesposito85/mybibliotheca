@@ -70,77 +70,87 @@ class MetadataSettingsCache:
     def __init__(self, data_dir: str):
         self.path = Path(data_dir) / 'metadata_settings.json'
         self._cache: Optional[Dict[str, Any]] = None
+        # Serialize load/save so concurrent Gunicorn threads don't observe a
+        # half-populated _cache dict or interleave a write with a load.
+        import threading as _threading
+        self._lock = _threading.RLock()
     def load(self) -> Dict[str, Any]:
-        if self._cache is not None:
-            return self._cache
-        if self.path.exists():
-            try:
-                with open(self.path, 'r') as f:
-                    data = json.load(f)
-            except Exception:
+        with self._lock:
+            if self._cache is not None:
+                return self._cache
+            if self.path.exists():
+                try:
+                    with open(self.path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            else:
                 data = {}
-        else:
-            data = {}
-        base_books_raw = data.get('books')
-        base_people_raw = data.get('people')
-        base_books = base_books_raw if isinstance(base_books_raw, dict) else {}
-        base_people = base_people_raw if isinstance(base_people_raw, dict) else {}
-        def_books = _defaults_for('books')
-        def_people = _defaults_for('people')
-        for k,v in def_books.items():
-            base_books.setdefault(k, v)
-        for k,v in def_people.items():
-            base_people.setdefault(k, v)
-        self._cache = {'books': base_books, 'people': base_people}
-        return self._cache
+            base_books_raw = data.get('books')
+            base_people_raw = data.get('people')
+            base_books = base_books_raw if isinstance(base_books_raw, dict) else {}
+            base_people = base_people_raw if isinstance(base_people_raw, dict) else {}
+            def_books = _defaults_for('books')
+            def_people = _defaults_for('people')
+            for k,v in def_books.items():
+                base_books.setdefault(k, v)
+            for k,v in def_people.items():
+                base_people.setdefault(k, v)
+            self._cache = {'books': base_books, 'people': base_people}
+            return self._cache
     def save(self, incoming: Dict[str, Any]) -> bool:
         try:
-            current = self.load()
-            for entity in ['books','people']:
-                if entity not in incoming or not isinstance(incoming[entity], dict):
-                    continue
-                for field, cfg in incoming[entity].items():
-                    if field not in current[entity]:
+            with self._lock:
+                current = self.load()
+                for entity in ['books','people']:
+                    if entity not in incoming or not isinstance(incoming[entity], dict):
                         continue
-                    if not isinstance(cfg, dict):
-                        continue
-                    mode = str(cfg.get('mode','both')).lower()
-                    allowed_providers = BOOK_FIELD_PROVIDERS.get(field, {'google','openlibrary'}) if entity == 'books' else PERSON_FIELD_PROVIDERS.get(field, {'openlibrary'})
-                    # Determine allowed modes for this field
-                    if allowed_providers == {'google'}:
-                        valid_modes = {'google','none'}
-                    elif allowed_providers == {'openlibrary'}:
-                        valid_modes = {'openlibrary','none'}
-                    else:
-                        valid_modes = {'google','openlibrary','both','none'}
-                    if mode not in valid_modes:
-                        # Coerce invalid submissions to sensible default
-                        mode = 'google' if 'google' in allowed_providers else next(iter(allowed_providers))
-                    entry: Dict[str, Any] = {'mode': mode}
-                    if mode == 'both':
-                        default = str(cfg.get('default','google')).lower()
-                        if default not in ('google','openlibrary'):
-                            default = 'google'
-                        entry['default'] = default
-                    current[entity][field] = entry
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path,'w') as f:
-                json.dump(current, f, indent=2)
-            self._cache = current
-            return True
+                    for field, cfg in incoming[entity].items():
+                        if field not in current[entity]:
+                            continue
+                        if not isinstance(cfg, dict):
+                            continue
+                        mode = str(cfg.get('mode','both')).lower()
+                        allowed_providers = BOOK_FIELD_PROVIDERS.get(field, {'google','openlibrary'}) if entity == 'books' else PERSON_FIELD_PROVIDERS.get(field, {'openlibrary'})
+                        # Determine allowed modes for this field
+                        if allowed_providers == {'google'}:
+                            valid_modes = {'google','none'}
+                        elif allowed_providers == {'openlibrary'}:
+                            valid_modes = {'openlibrary','none'}
+                        else:
+                            valid_modes = {'google','openlibrary','both','none'}
+                        if mode not in valid_modes:
+                            # Coerce invalid submissions to sensible default
+                            mode = 'google' if 'google' in allowed_providers else next(iter(allowed_providers))
+                        entry: Dict[str, Any] = {'mode': mode}
+                        if mode == 'both':
+                            default = str(cfg.get('default','google')).lower()
+                            if default not in ('google','openlibrary'):
+                                default = 'google'
+                            entry['default'] = default
+                        current[entity][field] = entry
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path, 'w', encoding='utf-8') as f:
+                    json.dump(current, f, indent=2)
+                self._cache = current
+                return True
         except Exception:
             return False
+import threading as _threading_for_cache_init
 _global_cache: Optional[MetadataSettingsCache] = None
+_global_cache_lock = _threading_for_cache_init.Lock()
 
 def _get_cache() -> MetadataSettingsCache:
     from flask import current_app
     global _global_cache
     if _global_cache is None:
-        try:
-            data_dir = current_app.config.get('DATA_DIR','data')
-        except Exception:
-            data_dir = 'data'
-        _global_cache = MetadataSettingsCache(data_dir)
+        with _global_cache_lock:
+            if _global_cache is None:
+                try:
+                    data_dir = current_app.config.get('DATA_DIR','data')
+                except Exception:
+                    data_dir = 'data'
+                _global_cache = MetadataSettingsCache(data_dir)
     return _global_cache
 
 def get_metadata_settings() -> Dict[str, Any]:

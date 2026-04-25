@@ -268,38 +268,13 @@ def delete_field(field_id):
 @metadata_bp.route('/api/fields/search')
 @login_required
 def search_fields():
-    """API endpoint to search custom fields."""
-    try:
-        query = request.args.get('q', '').strip()
-        if not query:
-            return jsonify([])
-        
-        # Search user's fields and shareable fields
-        # TODO: Implement search_fields_sync in KuzuCustomFieldService
-        # For now, return empty results
-        fields = []
-        # fields = custom_field_service.search_fields_sync(query, current_user.id)
-        if fields is None:
-            fields = []
-        
-        # Return simplified field data for API
-        results = []
-        for field in fields[:20]:  # Limit to 20 results
-            results.append({
-                'id': field.id,
-                'name': field.name,
-                'display_name': field.display_name,
-                'field_type': field.field_type.value,
-                'description': field.description,
-                'is_shareable': field.is_shareable,
-                'is_global': field.is_global,
-                'created_by_me': field.created_by_user_id == current_user.id
-            })
-        
-        return jsonify(results)
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """API endpoint to search custom fields.
+
+    Currently the underlying ``search_fields_sync`` is not implemented;
+    return 501 instead of pretending success with an empty list — the UI was
+    silently showing "no results" forever.
+    """
+    return jsonify({'error': 'custom field search not implemented'}), 501
 
 
 @metadata_bp.route('/templates')

@@ -108,6 +108,8 @@ def run_abs_listening_sync_now():
         ps = int(page_size) if page_size else 200
     except Exception:
         ps = 200
+    # Clamp to a sane range — caller could otherwise request page_size=10**9.
+    ps = max(1, min(ps, 1000))
     try:
         runner = get_abs_sync_runner()
         task_id = runner.enqueue_listening_sync(str(current_user.id), page_size=ps)
@@ -124,9 +126,10 @@ def view_logs():
     """View debug logs."""
     debug_manager = get_debug_manager()
     
-    # Get date from query parameter
+    # Get date from query parameter — `type=int` returns the default on a
+    # non-int query string instead of raising.
     date_str = request.args.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
-    limit = int(request.args.get('limit', 100))
+    limit = request.args.get('limit', default=100, type=int) or 100
     category = request.args.get('category', '')
     
     logs = debug_manager.get_debug_logs(date_str, limit)
@@ -159,11 +162,9 @@ def abs_probe():
       updated_after: str
       user_id: str (ABS user ID; if omitted uses /api/me)
     """
-    try:
-        ps = int(request.args.get('page_size', 5))
-        pg = int(request.args.get('page', 0))
-    except Exception:
-        ps, pg = 5, 0
+    ps = request.args.get('page_size', default=5, type=int) or 5
+    pg = request.args.get('page', default=0, type=int) or 0
+    ps = max(1, min(ps, 1000))
     updated_after = request.args.get('updated_after') or None
     user_id = request.args.get('user_id') or ''
     settings = load_abs_settings()
@@ -172,8 +173,8 @@ def abs_probe():
         return jsonify({'ok': False, 'error': 'abs_not_configured'}), 400
     # Resolve user id via /api/me if not supplied
     if not user_id:
-        me = client.get_me()
-        if me.get('ok'):
+        me = client.get_me() or {}
+        if isinstance(me, dict) and me.get('ok'):
             m = me.get('user') or {}
             if isinstance(m, dict):
                 user_id = str(m.get('id') or m.get('_id') or m.get('userId') or '')
@@ -242,7 +243,7 @@ def logs_api():
     debug_manager = get_debug_manager()
     
     date_str = request.args.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
-    limit = int(request.args.get('limit', 100))
+    limit = request.args.get('limit', default=100, type=int) or 100
     category = request.args.get('category', '')
     
     logs = debug_manager.get_debug_logs(date_str, limit)

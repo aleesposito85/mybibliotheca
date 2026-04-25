@@ -1122,10 +1122,14 @@ def api_delete_user(user_id):
             return jsonify({'ok': False, 'error': 'missing id'}), 400
         if getattr(current_user, 'id', None) == user_id:
             return jsonify({'ok': False, 'error': 'cannot delete self'}), 400
-        # Optional admin password verification (if provided)
-        admin_pwd = request.form.get('admin_password') or request.json.get('admin_password') if request.is_json else None  # type: ignore
-        if admin_pwd and not current_user.check_password(admin_pwd):  # type: ignore
-            return jsonify({'ok': False, 'error': 'admin password invalid'}), 400
+        # Require admin password verification — operator-precedence bug previously
+        # let an empty admin_pwd skip the check entirely.
+        admin_pwd = request.form.get('admin_password')
+        if not admin_pwd and request.is_json:
+            json_body = request.get_json(silent=True) or {}
+            admin_pwd = json_body.get('admin_password')
+        if not admin_pwd or not current_user.check_password(admin_pwd):  # type: ignore
+            return jsonify({'ok': False, 'error': 'admin password required'}), 401
         user = user_service.get_user_by_id_sync(user_id)
         if not user:
             _log('info', f"[USER_DELETE_DEBUG_API] user not found user_id={user_id}")

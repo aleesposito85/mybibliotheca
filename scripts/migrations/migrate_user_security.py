@@ -16,7 +16,8 @@ def migrate_database(db_path='data/books.db'):
     if not os.path.exists(db_path):
         print(f"Database not found at {db_path}")
         return False
-    
+
+    conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()

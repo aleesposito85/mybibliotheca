@@ -75,16 +75,28 @@ class Config:
             # lead to session corruption and CSRF failures.
             raise ValueError("No SECRET_KEY set for Flask application. Please set it in your .env file.")
     
-    # CSRF Settings with better defaults
+    # CSRF / cookie security. `BEHIND_HTTPS` is the explicit knob; when unset
+    # we default to secure UNLESS FLASK_DEBUG is on (typical local dev over
+    # plain HTTP, where a Secure cookie would be rejected by browsers).
+    _flask_debug = os.environ.get('FLASK_DEBUG', '').strip().lower() in ('1', 'true', 'yes')
+    _behind_https_env = os.environ.get('BEHIND_HTTPS')
+    if _behind_https_env is None:
+        _behind_https = not _flask_debug
+    else:
+        _behind_https = _behind_https_env.strip().lower() in ('1', 'true', 'yes')
+
     WTF_CSRF_ENABLED = True
     WTF_CSRF_TIME_LIMIT = 3600  # 1 hour
-    WTF_CSRF_SSL_STRICT = False  # Allow CSRF over HTTP for development
-    
+    WTF_CSRF_SSL_STRICT = _behind_https
+
     # Session settings for better reliability
-    # For development, disable secure cookies to allow HTTP sessions
-    SESSION_COOKIE_SECURE = False  # Set to True only in production with HTTPS
+    SESSION_COOKIE_SECURE = _behind_https
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = 'Lax'
+
+    # Upload size cap — prevents 10 GB cover/CSV uploads OOM-killing the worker.
+    # Override via MAX_CONTENT_LENGTH env (bytes).
+    MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH', 16 * 1024 * 1024))
     # SESSION_PERMANENT default is False - will be set to True in login route when "Remember Me" is checked
     # This allows users to have both temporary sessions (browser close = logout) and persistent sessions
     SESSION_PERMANENT = False

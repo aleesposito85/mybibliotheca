@@ -22,9 +22,14 @@ _IMPORT_VERBOSE = (
     or (_os_for_verbose.getenv('IMPORT_VERBOSE') or 'false').lower() == 'true'
 )
 
+import builtins as _builtins_for_dprint
+
 def _dprint(*args, **kwargs):
+    # `__builtins__` is a dict in non-__main__ modules and a module in
+    # __main__ — accessing `.print` blows up the first form. Use the
+    # imported ``builtins`` module so this works regardless of import path.
     if _IMPORT_VERBOSE:
-        __builtins__.print(*args, **kwargs)
+        _builtins_for_dprint.print(*args, **kwargs)
 
 # Shadow print in this module to respect verbosity toggle
 print = _dprint
@@ -37,11 +42,17 @@ _SEARCH_CACHE_LOCK = threading.RLock()
 
 _GOOGLE_CONNECT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_GOOGLE_CONNECT_TIMEOUT') or '2.5'))
 _GOOGLE_READ_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_GOOGLE_READ_TIMEOUT') or '3.5'))
-_OPENLIBRARY_CONNECT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_CONNECT_TIMEOUT') or '2.5'))
-_OPENLIBRARY_READ_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_READ_TIMEOUT') or '4.5'))
+_OPENLIBRARY_CONNECT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_CONNECT_TIMEOUT') or '6'))
+# OpenLibrary search.json with `fields=...,isbn` returns hundreds of ISBNs per
+# popular doc, so the payload is large; the previous 4.5s ceiling timed out
+# under any load and produced empty results.
+_OPENLIBRARY_READ_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_READ_TIMEOUT') or '10'))
 _GOOGLE_RESULT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_GOOGLE_RESULT_TIMEOUT') or '3.8'))
-_OPENLIBRARY_RESULT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_RESULT_TIMEOUT') or '5.0'))
-_BOOK_SEARCH_GLOBAL_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_GLOBAL_TIMEOUT') or '5.5'))
+_OPENLIBRARY_RESULT_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_OPENLIBRARY_RESULT_TIMEOUT') or '12'))
+# Global budget needs to accommodate Google rate-limit retries plus a slower
+# OpenLibrary call when ISBNs are requested. 5.5s used to skip OL whenever
+# Google was even slightly slow.
+_BOOK_SEARCH_GLOBAL_TIMEOUT = float((_os_for_verbose.getenv('BOOK_SEARCH_GLOBAL_TIMEOUT') or '15'))
 
 
 
@@ -404,13 +415,22 @@ def search_openlibrary(title: str, max_results: int = 20, author: Optional[str] 
     if not title:
         return []
     
-    # Prepare search query
+    # Prepare search query.
+    #
+    # OpenLibrary's search.json returns a sparse default field set when `fields`
+    # is omitted — `isbn` is NOT included, which meant every result here got
+    # isbn_10=None/isbn_13=None, and the front-end's isbn_required=true filter
+    # silently dropped them all. Request the fields we actually consume.
+    OL_FIELDS = (
+        "key,title,subtitle,author_name,publisher,first_publish_year,publish_year,"
+        "isbn,language,subject,cover_i"
+    )
     q_title = quote_plus(title)
     if author and isinstance(author, str) and author.strip():
         q_author = quote_plus(author.strip())
-        url = f"https://openlibrary.org/search.json?title={q_title}&author={q_author}&limit={max_results}"
+        url = f"https://openlibrary.org/search.json?title={q_title}&author={q_author}&limit={max_results}&fields={OL_FIELDS}"
     else:
-        url = f"https://openlibrary.org/search.json?title={q_title}&limit={max_results}"
+        url = f"https://openlibrary.org/search.json?title={q_title}&limit={max_results}&fields={OL_FIELDS}"
     
     try:
         response = requests.get(url, timeout=(_OPENLIBRARY_CONNECT_TIMEOUT, _OPENLIBRARY_READ_TIMEOUT))

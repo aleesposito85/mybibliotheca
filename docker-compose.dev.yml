@@ -22,6 +22,9 @@ services:
       - TIMEZONE=UTC
       - READING_STREAK_OFFSET=0
       - FLASK_DEBUG=true
+      # Local dev runs on plain HTTP localhost — browsers reject Secure
+      # cookies on http://, so disable BEHIND_HTTPS for the dev stack.
+      - BEHIND_HTTPS=false
       
       # CRITICAL: Single worker for KuzuDB compatibility
       - WORKERS=1

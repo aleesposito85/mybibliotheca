@@ -1098,12 +1098,13 @@ def add_book_from_image():
             isbn = extract_isbn_from_image(file)
             
             if not isbn:
-                # Return structured JSON with success flag so the UI can show a friendly message
+                # Return structured JSON with a 422 — the upload was syntactically OK
+                # but no ISBN could be extracted (was 200 even on failure).
                 return jsonify({
                     'success': False,
                     'error': 'No ISBN found in image. Please try a clearer image with visible barcode or ISBN text.',
                     'suggestion': 'Make sure the barcode or ISBN text is clearly visible and well-lit'
-                })
+                }), 422
             
             # Optionally fetch unified book data using the extracted ISBN (not required by UI)
             # UI will call unified-metadata separately after we return ISBN, but we include
@@ -1768,14 +1769,23 @@ def toggle_finished(uid):
     
     finish_date = user_book.get('finish_date') if isinstance(user_book, dict) else getattr(user_book, 'finish_date', None)
     if finish_date:
-        # Mark as currently reading
-        book_service.update_book_sync(uid, str(current_user.id), finish_date=None)
+        # Mark as currently reading — also clear the canonical reading_status
+        # enum so library views that filter by reading_status stay consistent.
+        book_service.update_book_sync(
+            uid, str(current_user.id),
+            finish_date=None,
+            reading_status='currently_reading',
+        )
         flash('Book marked as currently reading.')
     else:
-        # Mark as finished
-        book_service.update_book_sync(uid, str(current_user.id), finish_date=date.today())
+        # Mark as finished — keep the enum in sync.
+        book_service.update_book_sync(
+            uid, str(current_user.id),
+            finish_date=date.today(),
+            reading_status='finished',
+        )
         flash('Book marked as finished.')
-    
+
     return redirect(url_for('book.view_book_enhanced', uid=uid))
 
 @book_bp.route('/book/<uid>/start_reading', methods=['POST'])
@@ -1804,7 +1814,9 @@ def update_status(uid):
     if not user_book:
         abort(404)
     
-    # Set status based on checkboxes
+    # Set status based on checkboxes. Always derive a canonical
+    # reading_status so the enum can't drift from the legacy boolean flags
+    # (and the all-checkboxes-off branch isn't a no-op).
     want_to_read = 'want_to_read' in request.form
     library_only = 'library_only' in request.form
     finished = 'finished' in request.form
@@ -1812,20 +1824,22 @@ def update_status(uid):
 
     update_data = {
         'want_to_read': want_to_read,
-        'library_only': library_only
+        'library_only': library_only,
     }
 
     if finished:
         update_data.update({  # type: ignore
             'finish_date': datetime.now().date(),
             'want_to_read': False,
-            'library_only': False
+            'library_only': False,
+            'reading_status': 'finished',
         })
     elif currently_reading:
         update_data.update({  # type: ignore
             'finish_date': None,
             'want_to_read': False,
-            'library_only': False
+            'library_only': False,
+            'reading_status': 'currently_reading',
         })
         start_date = user_book.get('start_date') if isinstance(user_book, dict) else getattr(user_book, 'start_date', None)
         if not start_date:
@@ -1833,12 +1847,21 @@ def update_status(uid):
     elif want_to_read:
         update_data.update({  # type: ignore
             'finish_date': None,
-            'library_only': False
+            'library_only': False,
+            'reading_status': 'plan_to_read',
         })
     elif library_only:
         update_data.update({  # type: ignore
             'finish_date': None,
-            'want_to_read': False
+            'want_to_read': False,
+            'reading_status': 'library_only',
+        })
+    else:
+        # All checkboxes off — clear status entirely so the book doesn't
+        # silently keep its previous state.
+        update_data.update({  # type: ignore
+            'finish_date': None,
+            'reading_status': None,
         })
 
     book_service.update_book_sync(uid, str(current_user.id), **update_data)
@@ -1893,10 +1916,10 @@ def library():
 
     # Total count first so we can clamp page to a valid range (cache for short TTL)
     try:
-        from app.utils.simple_cache import cache_get, cache_set
+        from app.utils.simple_cache import cache_get, cache_set, MISS
         _tc_key = f"total_count:{current_user.id}"
         total_books = cache_get(_tc_key)
-        if total_books is None:
+        if total_books is MISS:
             total_books = book_service.get_total_book_count_sync()
             cache_set(_tc_key, int(total_books or 0), ttl_seconds=300)
     except Exception:
@@ -1924,11 +1947,11 @@ def library():
     if has_filter:
         try:
             # Use short-lived cache for expensive all-books call
-            from app.utils.simple_cache import cache_get, cache_set, get_user_library_version
+            from app.utils.simple_cache import cache_get, cache_set, get_user_library_version, MISS
             version = get_user_library_version(str(current_user.id))
             cache_key = f"all_books_overlay:{current_user.id}:v{version}"
             user_books = cache_get(cache_key)
-            if user_books is None:
+            if user_books is MISS:
                 user_books = book_service.get_all_books_with_user_overlay_sync(str(current_user.id))
                 cache_set(cache_key, user_books, ttl_seconds=120)
         except Exception:
@@ -1936,11 +1959,11 @@ def library():
     else:
         # Cache paginated slice for short TTL
         try:
-            from app.utils.simple_cache import cache_get, cache_set, get_user_library_version
+            from app.utils.simple_cache import cache_get, cache_set, get_user_library_version, MISS
             version = get_user_library_version(str(current_user.id))
             cache_key = f"books_page:{current_user.id}:{per_page}:{offset}:{sort_option}:v{version}"
             user_books = cache_get(cache_key)
-            if user_books is None:
+            if user_books is MISS:
                 user_books = book_service.get_books_with_user_overlay_paginated_sync(str(current_user.id), per_page, offset, sort_option)
                 cache_set(cache_key, user_books, ttl_seconds=60)
         except Exception:
@@ -2017,11 +2040,11 @@ def library():
     
     # Global status counts (not page-limited)
     try:
-        from app.utils.simple_cache import cache_get, cache_set, get_user_library_version
+        from app.utils.simple_cache import cache_get, cache_set, get_user_library_version, MISS
         _ver = get_user_library_version(str(current_user.id))
         _sc_key = f"status_counts:{current_user.id}:v{_ver}"
         global_counts = cache_get(_sc_key)
-        if global_counts is None:
+        if global_counts is MISS:
             global_counts = book_service.get_library_status_counts_sync(str(current_user.id))
             cache_set(_sc_key, global_counts, ttl_seconds=180)
     except Exception:

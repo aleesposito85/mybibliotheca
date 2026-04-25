@@ -48,9 +48,19 @@ def _isbn10_to_13(isbn10: Optional[str]) -> Optional[str]:
 
 
 def _isbn13_to_10(isbn13: Optional[str]) -> Optional[str]:
-	"""Convert ISBN-13 (978/979) to ISBN-10, recalculating checksum."""
+	"""Convert ISBN-13 (978 prefix only) to ISBN-10, recalculating checksum.
+
+	979-prefixed ISBN-13s have no equivalent ISBN-10 form (the 979 range was
+	allocated specifically because the 978/EAN space was exhausted), so this
+	function returns None for them. The previous implementation accepted 979
+	ISBNs and returned a synthesized 10-character string that did not
+	correspond to any real book — downstream lookups then mismatched valid
+	979 records and dropped legitimate metadata.
+	"""
 	digits = _normalize_isbn_value(isbn13)
-	if len(digits) != 13 or not digits[:12].isdigit() or not digits.startswith(('978', '979')):
+	if len(digits) != 13 or not digits[:12].isdigit():
+		return None
+	if not digits.startswith('978'):
 		return None
 	core = digits[3:12]
 	if len(core) != 9 or not core.isdigit():

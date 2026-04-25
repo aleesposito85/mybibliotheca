@@ -514,7 +514,18 @@ def create_app():
                         return redirect(url_for('onboarding.start'))
                 else:
                     flash('Security token expired. Please try again.', 'error')
-                    return redirect(request.referrer or url_for('main.index'))
+                    # Only redirect to the referrer if it's same-origin —
+                    # otherwise an attacker can force a CSRF failure to bounce
+                    # the victim off-site (open redirect → phishing).
+                    safe_target = url_for('main.index')
+                    referrer = request.referrer
+                    if referrer:
+                        from urllib.parse import urlparse
+                        ref = urlparse(referrer)
+                        host_url = urlparse(request.host_url)
+                        if (ref.netloc == host_url.netloc and ref.scheme in ('http', 'https')):
+                            safe_target = referrer
+                    return redirect(safe_target)
         return e
 
     def check_for_migration_reminder():
@@ -762,14 +773,28 @@ def create_app():
                 debug_auth(f"User count check failed, redirecting to setup from: {request.endpoint}")
                 return redirect(url_for('auth.setup'))
         
+        # Enforce forced-password-change BEFORE the /api/ short-circuit so a
+        # session-authenticated user flagged password_must_change=True can't
+        # keep using the JSON API to bypass the change.
+        if (
+            current_user.is_authenticated
+            and getattr(current_user, 'password_must_change', False)
+        ):
+            if request.path.startswith('/api/'):
+                from flask import jsonify
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Password change required before API access'
+                }), 403
+
         # For API endpoints, skip the session-based authentication checks
         if request.path.startswith('/api/'):
             return
-        
+
         # Skip if user is not authenticated (for non-API endpoints)
         if not current_user.is_authenticated:
             return
-        
+
         # Skip for certain routes to avoid redirect loops
         allowed_endpoints = [
             'auth.forced_password_change',
@@ -790,7 +815,7 @@ def create_app():
             'serve_covers',
             'serve_uploads'
         ]
-        
+
         # Allow API and AJAX requests, and skip for static files and onboarding routes
         if (
             request.endpoint in allowed_endpoints
@@ -803,12 +828,7 @@ def create_app():
             or request.path.startswith('/uploads/')
         ):
             return
-        
-        # Check for migration needs (DISABLED - migration now manual only)
-        # Automatic migration detection disabled to prevent redirect loops
-        # Migration is now available only through admin panel -> /admin/migration
-        pass
-        
+
         # Check if user must change password
         if hasattr(current_user, 'password_must_change') and current_user.password_must_change:
             if request.endpoint != 'auth.forced_password_change':

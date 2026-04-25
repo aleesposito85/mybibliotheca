@@ -69,23 +69,25 @@ def setup():
 
 @auth.route('/setup/status')
 def setup_status():
-    """API endpoint to check setup status - useful for troubleshooting"""
+    """Public endpoint: only signals whether initial setup has been completed.
+
+    Authenticated admins see the diagnostic detail. Unauth callers used to be
+    able to probe user_count, csrf_enabled, debug_mode, kuzu_connected — each
+    a useful recon signal for an attacker scoping a small instance.
+    """
     try:
         user_count = cast(int, user_service.get_user_count_sync())
-        return {
-            'setup_completed': user_count > 0,
-            'user_count': user_count,
-            'csrf_enabled': current_app.config.get('WTF_CSRF_ENABLED', False),
-            'debug_mode': current_app.config.get('DEBUG_MODE', False),
-            'kuzu_connected': True  # If we got here, Kuzu is working
-        }
+        public = {'setup_completed': user_count > 0}
+        if current_user.is_authenticated and getattr(current_user, 'is_admin', False):
+            public.update({
+                'user_count': user_count,
+                'csrf_enabled': current_app.config.get('WTF_CSRF_ENABLED', False),
+                'debug_mode': current_app.config.get('DEBUG_MODE', False),
+                'kuzu_connected': True,
+            })
+        return public
     except Exception as e:
-        return {
-            'setup_completed': False,
-            'user_count': 0,
-            'error': str(e),
-            'kuzu_connected': False
-        }, 500
+        return {'setup_completed': False, 'error': 'unavailable'}, 500
 
 @auth.route('/login', methods=['GET', 'POST'])
 @debug_route('AUTH')
@@ -143,27 +145,39 @@ def login():
                 if user.failed_login_attempts > 0 or user.locked_until:
                     user.reset_failed_login()
                     user_service.update_user_sync(user)
-                
+
+                # Capture next= before clearing the session (mitigates fixation —
+                # a fresh session id is issued before login_user binds the user).
+                next_page = request.args.get('next')
+                remember = form.remember_me.data
+                session.clear()
+
                 # Set session as permanent if remember_me is checked
                 # This allows Flask-Login's remember cookie to work properly
-                if form.remember_me.data:
+                if remember:
                     session.permanent = True
                     debug_auth("Remember me enabled - session marked as permanent")
                 else:
                     session.permanent = False
                     debug_auth("Remember me not enabled - session non-permanent")
-                
-                login_user(user, remember=form.remember_me.data)
+
+                login_user(user, remember=remember)
                 debug_auth(f"User logged in successfully: {user.username}")
-                
+
                 # Check if user must change password
                 if user.password_must_change:
                     debug_auth("User must change password - redirecting to forced password change")
                     flash('You must change your password before continuing.', 'warning')
                     return redirect(url_for('auth.forced_password_change'))
-                
-                next_page = request.args.get('next')
-                if not next_page or not next_page.startswith('/'):
+
+                # Reject anything that isn't a same-origin path. `//evil.com` is
+                # a protocol-relative URL the browser would treat as off-site.
+                if (
+                    not next_page
+                    or not next_page.startswith('/')
+                    or next_page.startswith('//')
+                    or next_page.startswith('/\\')
+                ):
                     next_page = url_for('main.index')
                 debug_auth(f"Redirecting to: {next_page}")
                 flash(f'Welcome back, {user.username}!', 'success')
@@ -2892,8 +2906,16 @@ def update_timezone():
 
 
 @auth.route('/debug/user-count')
+@login_required
 def debug_user_count():
-    """Debug route to check user count - TEMPORARY"""
+    """Admin-only debug route to check user count.
+
+    Was previously unauthenticated and exposed repository diagnostics; now
+    requires an authenticated admin.
+    """
+    if not getattr(current_user, 'is_admin', False):
+        from flask import abort
+        abort(403)
     try:
         
         # Test multiple methods

@@ -198,30 +198,39 @@ class ISBNExtractor:
         return None
     
     def _validate_and_clean_isbn(self, isbn_candidate: str) -> Optional[str]:
-        """Validate and clean an ISBN candidate."""
+        """Validate and clean an ISBN candidate. Includes checksum verification.
+
+        OCR is noisy: without checksum validation, a misread "9781234567890"
+        would be accepted and used to fetch an unrelated book, polluting the
+        library. This catches that.
+        """
         if not isbn_candidate:
             return None
-        
-        # Remove all non-digit characters except X
-        cleaned = re.sub(r'[^\dXx]', '', isbn_candidate.strip())
-        
-        # Check length
-        if len(cleaned) not in [10, 13]:
-            return None
-        
-        # Basic validation
-        if len(cleaned) == 13:
-            # ISBN-13 should start with 978 or 979
+
+        cleaned = re.sub(r'[^\dXx]', '', isbn_candidate.strip()).upper()
+
+        if len(cleaned) == 13 and cleaned.isdigit():
             if not cleaned.startswith(('978', '979')):
                 return None
-            return cleaned
-        
-        elif len(cleaned) == 10:
-            # ISBN-10 validation (basic)
-            if cleaned[-1].upper() not in '0123456789X':
+            # ISBN-13 mod-10 checksum
+            total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(cleaned[:12]))
+            expected = (10 - (total % 10)) % 10
+            if expected != int(cleaned[12]):
                 return None
             return cleaned
-        
+
+        if len(cleaned) == 10 and re.fullmatch(r'[0-9]{9}[0-9X]', cleaned):
+            # ISBN-10 mod-11 checksum
+            total = 0
+            for i, c in enumerate(cleaned[:9]):
+                total += (10 - i) * int(c)
+            check = cleaned[9]
+            check_val = 10 if check == 'X' else int(check)
+            total += check_val
+            if total % 11 != 0:
+                return None
+            return cleaned
+
         return None
 
 

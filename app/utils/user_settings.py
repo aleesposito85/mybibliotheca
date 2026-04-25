@@ -137,7 +137,15 @@ def _data_dir() -> str:
         return 'data'
 
 
+_SAFE_USER_ID_RE = __import__('re').compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
 def _user_settings_path(user_id: str) -> str:
+    # Defense-in-depth: every existing caller passes current_user.id, but if
+    # any future endpoint forwards a URL-derived user_id here, an attacker
+    # could write outside ``data/user_settings/``.
+    if not user_id or not _SAFE_USER_ID_RE.match(str(user_id)):
+        raise ValueError(f"Invalid user_id for settings path: {user_id!r}")
     base = os.path.join(_data_dir(), 'user_settings')
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, f"{user_id}.json")
