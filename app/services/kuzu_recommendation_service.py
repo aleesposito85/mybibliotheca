@@ -189,3 +189,91 @@ def _dominant_reason(
                 return f"Read by people who liked {anchor_title}"
             return "Read by readers like you"
     return "Recommended for you"
+
+
+# ----- Cache keys --------------------------------------------------------
+
+_TTL_SURFACE = 3600                  # 1 hour
+_TTL_POPULAR = 21600                 # 6 hours
+_TTL_FINISHED_COUNT = 60             # 1 minute
+
+
+def _key_more_like_this(book_id: str, user_id: str) -> str:
+    return f"recs:more_like_this:{user_id}:v{get_user_library_version(user_id)}:b{book_id}"
+
+
+def _key_library_row(user_id: str) -> str:
+    return f"recs:library_row:{user_id}:v{get_user_library_version(user_id)}"
+
+
+def _key_page(user_id: str) -> str:
+    return f"recs:page:{user_id}:v{get_user_library_version(user_id)}"
+
+
+def _key_popular() -> str:
+    return "recs:popular_global"
+
+
+def _key_finished_count(user_id: str) -> str:
+    # Versioned so finishing a book invalidates instantly.
+    return f"recs:finished_count:{user_id}:v{get_user_library_version(user_id)}"
+
+
+# ----- Kuzu helpers -----------------------------------------------------
+
+def _result_to_rows(result) -> List[Dict[str, Any]]:
+    """Normalize the various shapes safe_execute_kuzu_query returns."""
+    if result is None:
+        return []
+    rows: List[Dict[str, Any]] = []
+    has_next = getattr(result, "has_next", None)
+    get_next = getattr(result, "get_next", None)
+    column_names = getattr(result, "get_column_names", lambda: None)()
+    if callable(has_next) and callable(get_next):
+        while result.has_next():
+            row = result.get_next()
+            if column_names:
+                rows.append({col: row[i] for i, col in enumerate(column_names)})
+            else:
+                rows.append({i: v for i, v in enumerate(row)})
+        return rows
+    if isinstance(result, list):
+        return [r for r in result if isinstance(r, dict)]
+    return rows
+
+
+def _count_finished_books(user_id: str) -> int:
+    """Return the count of HAS_PERSONAL_METADATA edges with non-null finish_date.
+
+    Cached for 60s per user (and version-keyed) to avoid repeating the count
+    across multiple service method calls within one request.
+    """
+    key = _key_finished_count(user_id)
+    cached = cache_get(key)
+    if cached is not MISS:
+        return int(cached)
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (u:User {id: $uid})-[m:HAS_PERSONAL_METADATA]->(:Book) "
+            "WHERE m.finish_date IS NOT NULL RETURN count(*) AS n",
+            {"uid": user_id},
+            user_id=user_id,
+            operation="recs_count_finished",
+        )
+        rows = _result_to_rows(result)
+        n = int(rows[0].get("n", 0)) if rows else 0
+    except Exception:
+        logger.exception("recs: count_finished_books failed for user %s", user_id)
+        n = 0
+    cache_set(key, n, ttl_seconds=_TTL_FINISHED_COUNT)
+    return n
+
+
+# ----- Service skeleton ------------------------------------------------
+
+class KuzuRecommendationService:
+    """See module docstring. Public methods: get_more_like_this_sync,
+    get_library_row_sync, get_top_picks_sync, get_continue_series_sync,
+    get_popular_sync, get_recommendations_page_sync.
+    """
+    # Methods are added in subsequent tasks.
