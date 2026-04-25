@@ -1,6 +1,6 @@
 """Smoke tests for the /books/scan blueprint via Flask test client."""
 import io
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from PIL import Image
@@ -28,6 +28,25 @@ def _jpeg_bytes(w=200, h=200):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
+
+
+def _mock_svc(**methods):
+    """Return a MagicMock configured with the given method return_values / side_effects.
+
+    Keyword args are method names; values are either plain return values or
+    dict(return_value=...) / dict(side_effect=...) for full control.
+    """
+    svc = MagicMock()
+    for name, spec in methods.items():
+        m = getattr(svc, name)
+        if isinstance(spec, dict):
+            if "return_value" in spec:
+                m.return_value = spec["return_value"]
+            if "side_effect" in spec:
+                m.side_effect = spec["side_effect"]
+        else:
+            m.return_value = spec
+    return svc
 
 
 def test_upload_page_redirects_when_anonymous(client):
@@ -60,8 +79,8 @@ def test_upload_happy_path(client, kuzu_seeded):
         "summary": {"detected": 0, "matched": 0, "already_owned": 0, "unmatched": 0},
         "preview_url": "/uploads/scans/abc123.jpg",
     }
-    with patch("app.routes.shelf_scan_routes.shelf_scan_service.scan_image_and_enrich_sync",
-               return_value=fake_result):
+    svc = _mock_svc(scan_image_and_enrich_sync=fake_result)
+    with patch("app.routes.shelf_scan_routes.shelf_scan_service", svc):
         res = client.post(
             "/books/scan/upload",
             data={"shelf_image": (io.BytesIO(_jpeg_bytes()), "shelf.jpg")},
@@ -75,8 +94,8 @@ def test_upload_llm_unavailable_returns_friendly_error(client, kuzu_seeded):
     from app.services.shelf_scan_service import ShelfScanLLMUnavailable
     _, ids = kuzu_seeded
     _login(client, ids["user_alice"])
-    with patch("app.routes.shelf_scan_routes.shelf_scan_service.scan_image_and_enrich_sync",
-               side_effect=ShelfScanLLMUnavailable()):
+    svc = _mock_svc(scan_image_and_enrich_sync={"side_effect": ShelfScanLLMUnavailable()})
+    with patch("app.routes.shelf_scan_routes.shelf_scan_service", svc):
         res = client.post(
             "/books/scan/upload",
             data={"shelf_image": (io.BytesIO(_jpeg_bytes()), "shelf.jpg")},
@@ -89,7 +108,8 @@ def test_upload_llm_unavailable_returns_friendly_error(client, kuzu_seeded):
 def test_confirm_returns_410_for_unknown_scan(client, kuzu_seeded):
     _, ids = kuzu_seeded
     _login(client, ids["user_alice"])
-    with patch("app.routes.shelf_scan_routes.shelf_scan_service.get_scan", return_value=None):
+    svc = _mock_svc(get_scan=None)
+    with patch("app.routes.shelf_scan_routes.shelf_scan_service", svc):
         res = client.post("/books/scan/confirm", data={
             "scan_id": "notreal",
             "detection_id": ["det_001"],
@@ -100,10 +120,11 @@ def test_confirm_returns_410_for_unknown_scan(client, kuzu_seeded):
 def test_confirm_happy_path(client, kuzu_seeded):
     _, ids = kuzu_seeded
     _login(client, ids["user_alice"])
-    with patch("app.routes.shelf_scan_routes.shelf_scan_service.get_scan",
-               return_value={"user_id": ids["user_alice"], "candidates": []}), \
-         patch("app.routes.shelf_scan_routes.shelf_scan_service.start_bulk_add_async",
-               return_value="task_xyz"):
+    svc = _mock_svc(
+        get_scan={"user_id": ids["user_alice"], "candidates": []},
+        start_bulk_add_async="task_xyz",
+    )
+    with patch("app.routes.shelf_scan_routes.shelf_scan_service", svc):
         res = client.post("/books/scan/confirm", data={
             "scan_id": "valid",
             "detection_id": ["det_001"],
@@ -125,7 +146,8 @@ def test_progress_returns_404_for_unknown_task(client, kuzu_seeded):
 def test_discard_removes_scan(client, kuzu_seeded):
     _, ids = kuzu_seeded
     _login(client, ids["user_alice"])
-    with patch("app.routes.shelf_scan_routes.shelf_scan_service.discard_scan", return_value=True):
+    svc = _mock_svc(discard_scan=True)
+    with patch("app.routes.shelf_scan_routes.shelf_scan_service", svc):
         res = client.post("/books/scan/abc/discard")
     assert res.status_code == 200
     assert res.get_json()["status"] == "success"
