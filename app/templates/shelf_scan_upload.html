@@ -37,6 +37,7 @@
   <div class="card mb-3">
     <div class="card-body">
       <form method="POST" action="{{ url_for('shelf_scan.upload') }}" enctype="multipart/form-data" id="shelf-scan-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="scan-upload-zone" id="upload-zone">
           <div id="upload-zone-content">
             <i class="bi bi-camera fs-1"></i>

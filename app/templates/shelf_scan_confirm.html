@@ -48,6 +48,7 @@
   </div>
 
   <form id="confirm-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="scan_id" value="{{ scan_id }}">
     <input type="hidden" name="overrides" id="overrides-input" value="{}">
 
@@ -186,8 +187,11 @@
 
   document.getElementById('discard-btn').addEventListener('click', function(){
     if (!confirm('Discard this scan? Anything you haven\'t added will be lost.')) return;
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
+              || document.querySelector('input[name="csrf_token"]')?.value;
     fetch('/books/scan/' + encodeURIComponent(scanId) + '/discard', {
-      method: 'POST', credentials: 'same-origin'
+      method: 'POST', credentials: 'same-origin',
+      headers: csrf ? { 'X-CSRFToken': csrf } : {}
     }).then(() => { window.location = '/books/scan/'; });
   });
 
