@@ -760,6 +760,24 @@ class KuzuRecommendationService:
         owned = _user_library_book_ids(user_id) if user_id else set()
         return [b for b in all_pop if b["id"] not in owned][:limit]
 
+    def get_recommendations_page_sync(self, user_id: str) -> Dict[str, Any]:
+        if not user_id:
+            return {"top_picks": [], "continue_series": [], "popular": [], "personalized": False}
+        key = _key_page(user_id)
+        cached = cache_get(key)
+        if cached is not MISS:
+            return cached
+        finished = _count_finished_books(user_id)
+        personalized = finished >= COLD_START_FINISHED_THRESHOLD
+        bundle = {
+            "top_picks": self.get_top_picks_sync(user_id, limit=20),
+            "continue_series": self.get_continue_series_sync(user_id, limit=10) if personalized else [],
+            "popular": self.get_popular_sync(user_id, limit=20),
+            "personalized": personalized,
+        }
+        cache_set(key, bundle, ttl_seconds=_TTL_SURFACE)
+        return bundle
+
     # --- helpers ---
 
     def _anchor_titles(self, anchors: List[str]) -> Dict[str, str]:

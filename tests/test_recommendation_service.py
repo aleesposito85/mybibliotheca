@@ -205,3 +205,23 @@ def test_popular_sync_excludes_user_library(kuzu_seeded, service):
     titles = [b["title"] for b in out]
     assert "Dune" not in titles  # alice already has it
     assert "Foundation" not in titles
+
+
+def test_recommendations_page_bundle_for_alice(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    bundle = service.get_recommendations_page_sync(ids["user_alice"])
+    assert set(bundle.keys()) == {"top_picks", "continue_series", "popular", "personalized"}
+    assert bundle["personalized"] is True
+    assert isinstance(bundle["top_picks"], list)
+    assert isinstance(bundle["continue_series"], list)
+    assert isinstance(bundle["popular"], list)
+
+
+def test_recommendations_page_bundle_cold_start(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    bundle = service.get_recommendations_page_sync(ids["user_newbie"])
+    assert bundle["personalized"] is False
+    # continue_series is gated behind personalized=True, so always empty here.
+    assert bundle["continue_series"] == []
+    # top_picks falls back to popular; both should have data from seed.
+    assert all(k in bundle for k in ("top_picks", "continue_series", "popular"))
