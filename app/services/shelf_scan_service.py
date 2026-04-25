@@ -137,6 +137,10 @@ JPEG_QUALITY = 85
 # Allowed input formats per PIL.
 _ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
 
+from concurrent.futures import ThreadPoolExecutor
+
+from app.utils.unified_metadata import fetch_unified_by_title
+
 # TTL for the scan store entries (1 hour).
 SCAN_STORE_TTL_SECONDS = 3600
 # Max scans per user per 24h. Override via env: SHELF_SCAN_DAILY_LIMIT_PER_USER.
@@ -145,6 +149,28 @@ DAILY_SCAN_LIMIT_PER_USER = int(os.environ.get("SHELF_SCAN_DAILY_LIMIT_PER_USER"
 IN_FLIGHT_TTL_SECONDS = 90
 # Window for the rate limiter (24h).
 RATE_LIMIT_WINDOW_SECONDS = 86400
+
+
+# Title-search results 0 → best_match, 1..MAX_ALTERNATIVES → alternatives.
+MAX_ALTERNATIVES = 4
+# Bounded concurrency for parallel enrichment.
+ENRICHMENT_WORKERS = 4
+
+
+def _project_match(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Reduce a unified_metadata result to the fields the confirmation card uses."""
+    return {
+        "title": m.get("title", ""),
+        "authors": m.get("authors") or [],
+        "isbn13": m.get("isbn13"),
+        "isbn10": m.get("isbn10"),
+        "cover_url": m.get("cover_url"),
+        "published_date": m.get("published_date"),
+        "page_count": m.get("page_count"),
+        "language": m.get("language"),
+        "description": m.get("description"),
+        "similarity_score": m.get("similarity_score"),
+    }
 
 
 class ShelfScanRateLimited(ShelfScanError):
@@ -331,3 +357,46 @@ class ShelfScanService:
     def _clear_scan_in_flight(self, user_id: str) -> None:
         with self._in_flight_lock:
             self._in_flight.pop(user_id, None)
+
+    # ---- Enrichment helpers -----------------------------------------------
+
+    def _enrich_one(self, detection: Dict[str, Any], detection_id: str) -> Dict[str, Any]:
+        """Fuzzy-match one detection against unified_metadata, return a candidate dict.
+
+        Failure modes (network error, empty result) collapse into
+        matched=False — never raise from here.
+        """
+        title = detection.get("title", "")
+        author = detection.get("author") or None
+        try:
+            results = fetch_unified_by_title(title, max_results=MAX_ALTERNATIVES + 1, author=author)
+        except Exception:
+            logger.exception("shelf_scan: enrichment lookup failed for %r", title)
+            results = []
+
+        best_match = _project_match(results[0]) if results else None
+        alternatives = [_project_match(r) for r in results[1:1 + MAX_ALTERNATIVES]]
+        matched = best_match is not None
+        default_selected = bool(matched and detection.get("confidence") == "high")
+
+        return {
+            "detection_id": detection_id,
+            "spine_position": int(detection.get("spine_position") or 0),
+            "confidence": detection.get("confidence", "medium"),
+            "detected": {
+                "title": title,
+                "author": detection.get("author", ""),
+            },
+            "matched": matched,
+            "best_match": best_match,
+            "alternatives": alternatives,
+            "default_selected": default_selected,
+        }
+
+    def _enrich_many(self, detections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Run _enrich_one across all detections in parallel."""
+        if not detections:
+            return []
+        items = [(d, f"det_{i + 1:03d}") for i, d in enumerate(detections)]
+        with ThreadPoolExecutor(max_workers=ENRICHMENT_WORKERS) as ex:
+            return list(ex.map(lambda pair: self._enrich_one(pair[0], pair[1]), items))

@@ -134,3 +134,67 @@ def test_in_flight_marker_blocks_concurrent_scan(service):
     # After clearing, can mark again.
     service._mark_scan_in_flight("user_alice")
     service._clear_scan_in_flight("user_alice")
+
+
+# ---- Task 7: Enrichment helper -------------------------------------------
+
+from unittest.mock import patch
+
+
+def test_enrich_one_returns_matched_when_metadata_found(service):
+    fake_metadata = [
+        {"title": "Dune", "authors": ["Frank Herbert"], "isbn13": "9780441172719",
+         "isbn10": "0441172717", "cover_url": "http://x", "published_date": "1990-01-01",
+         "page_count": 535, "language": "en", "description": "...",
+         "similarity_score": 0.95},
+        {"title": "Dune (Special Edition)", "authors": ["Frank Herbert"], "isbn13": "9780441013593",
+         "isbn10": "0441013597", "cover_url": "http://y", "published_date": "2005-04-05",
+         "page_count": 600, "language": "en", "description": "...",
+         "similarity_score": 0.85},
+    ]
+    detection = {"title": "Dune", "author": "Frank Herbert", "spine_position": 1, "confidence": "high"}
+    with patch("app.services.shelf_scan_service.fetch_unified_by_title", return_value=fake_metadata):
+        candidate = service._enrich_one(detection, detection_id="det_001")
+    assert candidate["matched"] is True
+    assert candidate["best_match"]["isbn13"] == "9780441172719"
+    assert len(candidate["alternatives"]) == 1
+    assert candidate["alternatives"][0]["isbn13"] == "9780441013593"
+    assert candidate["default_selected"] is True   # high+matched
+    assert candidate["spine_position"] == 1
+    assert candidate["detection_id"] == "det_001"
+
+
+def test_enrich_one_unmatched(service):
+    detection = {"title": "Nonexistent", "author": "", "spine_position": 2, "confidence": "low"}
+    with patch("app.services.shelf_scan_service.fetch_unified_by_title", return_value=[]):
+        candidate = service._enrich_one(detection, detection_id="det_002")
+    assert candidate["matched"] is False
+    assert candidate["best_match"] is None
+    assert candidate["alternatives"] == []
+    assert candidate["default_selected"] is False
+
+
+def test_enrich_one_low_confidence_unselected_even_when_matched(service):
+    fake = [{"title": "Dune", "authors": ["Frank Herbert"], "isbn13": "X",
+             "isbn10": None, "cover_url": "", "published_date": "",
+             "page_count": None, "language": "en", "description": "",
+             "similarity_score": 0.6}]
+    detection = {"title": "Dune", "author": "FH", "spine_position": 1, "confidence": "low"}
+    with patch("app.services.shelf_scan_service.fetch_unified_by_title", return_value=fake):
+        candidate = service._enrich_one(detection, detection_id="d")
+    assert candidate["matched"] is True
+    assert candidate["default_selected"] is False  # low confidence
+
+
+def test_enrich_one_caps_alternatives_at_4(service):
+    fake = [
+        {"title": f"Dune Edition {i}", "authors": ["Frank Herbert"],
+         "isbn13": str(9780000000000 + i), "isbn10": None, "cover_url": "",
+         "published_date": "", "page_count": None, "language": "en",
+         "description": "", "similarity_score": 0.9 - i * 0.01}
+        for i in range(10)
+    ]
+    detection = {"title": "Dune", "author": "FH", "spine_position": 1, "confidence": "high"}
+    with patch("app.services.shelf_scan_service.fetch_unified_by_title", return_value=fake):
+        candidate = service._enrich_one(detection, detection_id="d")
+    assert len(candidate["alternatives"]) == 4
