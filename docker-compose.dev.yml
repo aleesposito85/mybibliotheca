@@ -28,6 +28,16 @@ services:
       
       # CRITICAL: Single worker for KuzuDB compatibility
       - WORKERS=1
+
+      # Bookshelf scanner — point at host Ollama (override via env or .env).
+      # Default model is llama3.2-vision; change to whichever vision model
+      # you've pulled (`ollama list`).
+      - AI_PROVIDER=ollama
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=llama3.2-vision
+      - AI_FALLBACK_ENABLED=false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5054/"]
