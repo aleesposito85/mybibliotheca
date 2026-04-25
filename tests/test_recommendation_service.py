@@ -146,3 +146,62 @@ def test_continue_series_for_alice(kuzu_seeded):
     # alice's most recent series finish is foundation (20 days ago) vs dune3 (30),
     # so foundation continuation should come first.
     assert out[0]["next_book"]["title"] == "Foundation and Empire"
+
+
+def test_more_like_this_excludes_anchor_and_user_library(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    out = service.get_more_like_this_sync(
+        book_id=ids["book_dune"], user_id=ids["user_alice"], limit=10,
+    )
+    titles = [b["title"] for b in out]
+    # alice already finished Dune 1/2/3 + Foundation; none of those should appear.
+    assert "Dune" not in titles
+    assert "Dune Messiah" not in titles
+    assert "Foundation" not in titles
+    # Each result has a reason string.
+    for b in out:
+        assert b["recommendation_reason"]
+
+
+def test_more_like_this_for_bob_surfaces_dune3(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    # bob has read dune + dune2 + foundations + storm; dune3 is NOT in his library.
+    out = service.get_more_like_this_sync(
+        book_id=ids["book_dune"], user_id=ids["user_bob"], limit=10,
+    )
+    titles = [b["title"] for b in out]
+    assert "Children of Dune" in titles
+
+
+def test_top_picks_falls_back_to_popular_for_cold_user(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    # 'newbie' is seeded with no finishes (see _kuzu_seed.py).
+    out = service.get_top_picks_sync(user_id=ids["user_newbie"], limit=10)
+    # All of them are popular-fallback.
+    assert all(b["recommendation_reason"] == "Popular among readers" for b in out)
+
+
+def test_top_picks_personalized_for_alice(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    out = service.get_top_picks_sync(user_id=ids["user_alice"], limit=10)
+    # Should include at least one non-popular reason (real signal-driven rec).
+    reasons = {b["recommendation_reason"] for b in out}
+    assert any(r != "Popular among readers" for r in reasons)
+
+
+def test_continue_series_sync_returns_books(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    out = service.get_continue_series_sync(user_id=ids["user_alice"], limit=5)
+    titles = [b["title"] for b in out]
+    assert "Foundation and Empire" in titles
+    # Continue-series cards always carry the volume reason.
+    for b in out:
+        assert "Volume" in b["recommendation_reason"] or "Next in" in b["recommendation_reason"]
+
+
+def test_popular_sync_excludes_user_library(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    out = service.get_popular_sync(user_id=ids["user_alice"], limit=20)
+    titles = [b["title"] for b in out]
+    assert "Dune" not in titles  # alice already has it
+    assert "Foundation" not in titles

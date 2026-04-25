@@ -618,4 +618,160 @@ class KuzuRecommendationService:
     get_library_row_sync, get_top_picks_sync, get_continue_series_sync,
     get_popular_sync, get_recommendations_page_sync.
     """
-    # Methods are added in subsequent tasks.
+
+    # --- internal: shared scoring pipeline ---
+
+    def _score_for_anchors(
+        self,
+        anchors: List[str],
+        anchor_titles: Dict[str, str],
+        user_id: str,
+        limit: int,
+        single_anchor_series: bool,
+    ) -> List[Dict[str, Any]]:
+        if not anchors:
+            return []
+        author_sig = _signal_shared_authors(anchors)
+        category_sig = _signal_shared_categories(anchors)
+        if single_anchor_series:
+            series_sig = _signal_same_series(anchors[0])
+        else:
+            series_sig = {}
+        coreader_sig = _signal_coreaders(anchors)
+
+        candidate_ids = (
+            set(author_sig)
+            | set(category_sig)
+            | set(series_sig)
+            | set(coreader_sig)
+        )
+        # Drop the anchors themselves and books the user already owns.
+        candidate_ids.difference_update(anchors)
+        candidate_ids.difference_update(_user_library_book_ids(user_id))
+        if not candidate_ids:
+            return []
+
+        lang_sig = _signal_language_match(anchors, candidate_ids)
+
+        # Build the merged signal map the scorer consumes.
+        merged: Dict[str, Dict[str, Any]] = {}
+        for cid in candidate_ids:
+            a = author_sig.get(cid, {})
+            c = category_sig.get(cid, {})
+            s = series_sig.get(cid, {})
+            cr = coreader_sig.get(cid, {})
+            merged[cid] = {
+                "author": a.get("count", 0),
+                "top_author_name": a.get("top_author_name"),
+                "category": c.get("count", 0),
+                "top_category_name": c.get("top_category_name"),
+                "series": s.get("count", 0),
+                "series_name": s.get("series_name"),
+                "next_volume_number": s.get("volume_number"),
+                "series_next_volume": 1 if s.get("next_volume") else 0,
+                "coreader": cr.get("count", 0),
+                "anchor_id": cr.get("anchor_id") or (anchors[0] if anchors else None),
+                "language": 1 if lang_sig.get(cid) else 0,
+            }
+        ranked = score_candidates(merged, anchor_titles)
+        ranked = ranked[:limit]
+        ordered_ids = [r["book_id"] for r in ranked]
+        books = _hydrate_books(ordered_ids)
+        # Stitch reason + score onto each hydrated book by id.
+        rank_by_id = {r["book_id"]: r for r in ranked}
+        for b in books:
+            r = rank_by_id.get(b["id"], {})
+            b["recommendation_reason"] = r.get("recommendation_reason", "Recommended for you")
+            b["score"] = r.get("score")
+        return books
+
+    # --- public surfaces ---
+
+    def get_more_like_this_sync(
+        self, book_id: str, user_id: str, limit: int = 8,
+    ) -> List[Dict[str, Any]]:
+        if not book_id or not user_id:
+            return []
+        key = _key_more_like_this(book_id, user_id)
+        cached = cache_get(key)
+        if cached is not MISS:
+            return cached[:limit]
+        anchor_titles = self._anchor_titles([book_id])
+        results = self._score_for_anchors(
+            anchors=[book_id],
+            anchor_titles=anchor_titles,
+            user_id=user_id,
+            limit=limit,
+            single_anchor_series=True,
+        )
+        cache_set(key, results, ttl_seconds=_TTL_SURFACE)
+        return results
+
+    def get_library_row_sync(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        if not user_id:
+            return []
+        key = _key_library_row(user_id)
+        cached = cache_get(key)
+        if cached is not MISS:
+            return cached[:limit]
+        if _count_finished_books(user_id) < COLD_START_FINISHED_THRESHOLD:
+            results = self.get_popular_sync(user_id, limit=limit)
+        else:
+            anchors = _recent_finished_anchors(user_id, TOP_PICKS_ANCHOR_COUNT)
+            anchor_titles = self._anchor_titles(anchors)
+            results = self._score_for_anchors(
+                anchors=anchors,
+                anchor_titles=anchor_titles,
+                user_id=user_id,
+                limit=limit,
+                single_anchor_series=False,
+            )
+            if not results:
+                results = self.get_popular_sync(user_id, limit=limit)
+        cache_set(key, results, ttl_seconds=_TTL_SURFACE)
+        return results
+
+    def get_top_picks_sync(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        if not user_id:
+            return []
+        if _count_finished_books(user_id) < COLD_START_FINISHED_THRESHOLD:
+            return self.get_popular_sync(user_id, limit=limit)
+        anchors = _recent_finished_anchors(user_id, TOP_PICKS_ANCHOR_COUNT)
+        anchor_titles = self._anchor_titles(anchors)
+        results = self._score_for_anchors(
+            anchors=anchors,
+            anchor_titles=anchor_titles,
+            user_id=user_id,
+            limit=limit,
+            single_anchor_series=False,
+        )
+        if not results:
+            results = self.get_popular_sync(user_id, limit=limit)
+        return results
+
+    def get_continue_series_sync(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        if not user_id:
+            return []
+        rows = _continue_series_for(user_id, limit=limit)
+        return [r["next_book"] for r in rows]
+
+    def get_popular_sync(self, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        all_pop = _popular_global(limit=50)
+        owned = _user_library_book_ids(user_id) if user_id else set()
+        return [b for b in all_pop if b["id"] not in owned][:limit]
+
+    # --- helpers ---
+
+    def _anchor_titles(self, anchors: List[str]) -> Dict[str, str]:
+        if not anchors:
+            return {}
+        try:
+            result = safe_execute_kuzu_query(
+                "MATCH (b:Book) WHERE b.id IN $ids RETURN b.id AS id, b.title AS title",
+                {"ids": list(anchors)},
+                operation="recs_anchor_titles",
+            )
+            return {r["id"]: r.get("title", "") for r in _result_to_rows(result) if r.get("id")}
+        except Exception:
+            logger.exception("recs: _anchor_titles failed")
+            return {}
