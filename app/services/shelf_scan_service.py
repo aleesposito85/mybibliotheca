@@ -116,3 +116,112 @@ def _parse_shelf_response(raw: str) -> List[Dict[str, Any]]:
 
     books.sort(key=lambda b: b["spine_position"])
     return books
+
+
+# ---- Image preprocessing ------------------------------------------------
+
+import io
+import os
+from typing import Tuple
+
+from PIL import Image, UnidentifiedImageError
+
+
+# Long-edge cap for resize. 2048 keeps spine recognition accurate while
+# cutting cloud-LLM payload ~10x for typical phone photos.
+MAX_LONG_EDGE = 2048
+# JPEG quality for the resized preview / LLM input.
+JPEG_QUALITY = 85
+# Allowed input formats per PIL.
+_ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
+
+
+class ShelfScanService:
+    """Orchestrator for the bookshelf-scanner feature.
+
+    Wires AIService (vision LLM) → unified_metadata (fuzzy match) →
+    simplified_book_service (bulk add) into a single user-facing flow.
+    """
+
+    def __init__(self):
+        # Scan store, rate limiter, in-flight tracker — populated in later tasks.
+        # Declared here so the `service` fixture can construct one without args.
+        pass
+
+    # ---- Public-ish helpers (exposed for tests) -------------------------
+
+    def _uploads_dir(self) -> str:
+        """Resolve the uploads/scans directory.
+
+        Order of precedence (matches existing image_processing.get_covers_dir
+        pattern):
+          1. /app/data/uploads/scans (Docker)
+          2. {DATA_DIR}/uploads/scans
+          3. {repo_root}/data/uploads/scans
+        Creates the directory if missing.
+        """
+        from flask import current_app
+        candidate = "/app/data/uploads/scans"
+        if not os.path.isdir(candidate):
+            data_dir = None
+            try:
+                data_dir = current_app.config.get("DATA_DIR")
+            except Exception:
+                data_dir = None
+            if data_dir:
+                candidate = os.path.join(data_dir, "uploads", "scans")
+            else:
+                # repo_root/data/uploads/scans
+                root = os.path.dirname(current_app.root_path) if hasattr(current_app, "root_path") else os.getcwd()
+                candidate = os.path.join(root, "data", "uploads", "scans")
+        os.makedirs(candidate, exist_ok=True)
+        return candidate
+
+    def _preprocess(
+        self,
+        image_bytes: bytes,
+        original_filename: str,
+        scan_id: str,
+    ) -> Tuple[bytes, str]:
+        """Validate, resize, and persist a preview of the uploaded image.
+
+        Returns ``(resized_jpeg_bytes, preview_url)`` where preview_url is
+        the relative URL the confirmation page can render via the existing
+        /uploads/<...> static handler.
+
+        Raises ``ValueError`` for unsupported / corrupt image inputs.
+        """
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as probe:
+                probe.verify()
+        except (UnidentifiedImageError, Exception) as e:
+            raise ValueError(f"Invalid image data: {e}") from e
+
+        # verify() consumed the file pointer; re-open for actual decode.
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+        except UnidentifiedImageError as e:
+            raise ValueError("Invalid image data") from e
+
+        if img.format not in _ALLOWED_FORMATS:
+            raise ValueError(f"Unsupported image format: {img.format!r}")
+
+        # Resize so the longer edge is <= MAX_LONG_EDGE.
+        if max(img.size) > MAX_LONG_EDGE:
+            ratio = MAX_LONG_EDGE / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        # Always emit JPEG (smaller, lower bandwidth to LLMs).
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        out_buf = io.BytesIO()
+        img.save(out_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        resized_bytes = out_buf.getvalue()
+
+        out_path = os.path.join(self._uploads_dir(), f"{scan_id}.jpg")
+        with open(out_path, "wb") as f:
+            f.write(resized_bytes)
+
+        preview_url = f"/uploads/scans/{scan_id}.jpg"
+        return resized_bytes, preview_url
