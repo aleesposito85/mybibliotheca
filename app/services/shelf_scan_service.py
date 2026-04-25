@@ -122,7 +122,9 @@ def _parse_shelf_response(raw: str) -> List[Dict[str, Any]]:
 
 import io
 import os
-from typing import Tuple
+import threading
+import time
+from typing import Any, Dict, Tuple
 
 from PIL import Image, UnidentifiedImageError
 
@@ -135,6 +137,23 @@ JPEG_QUALITY = 85
 # Allowed input formats per PIL.
 _ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
 
+# TTL for the scan store entries (1 hour).
+SCAN_STORE_TTL_SECONDS = 3600
+# Max scans per user per 24h. Override via env: SHELF_SCAN_DAILY_LIMIT_PER_USER.
+DAILY_SCAN_LIMIT_PER_USER = int(os.environ.get("SHELF_SCAN_DAILY_LIMIT_PER_USER", "30"))
+# How long an in-flight marker is valid (90s) before we forget about it.
+IN_FLIGHT_TTL_SECONDS = 90
+# Window for the rate limiter (24h).
+RATE_LIMIT_WINDOW_SECONDS = 86400
+
+
+class ShelfScanRateLimited(ShelfScanError):
+    """Raised when a user has exceeded DAILY_SCAN_LIMIT_PER_USER."""
+
+
+class ShelfScanInProgress(ShelfScanError):
+    """Raised when a user already has a scan in flight."""
+
 
 class ShelfScanService:
     """Orchestrator for the bookshelf-scanner feature.
@@ -144,9 +163,12 @@ class ShelfScanService:
     """
 
     def __init__(self):
-        # Scan store, rate limiter, in-flight tracker — populated in later tasks.
-        # Declared here so the `service` fixture can construct one without args.
-        pass
+        self._scan_store: Dict[str, Dict[str, Any]] = {}
+        self._scan_store_lock = threading.RLock()
+        self._rate_limit: Dict[str, list] = {}            # user_id -> [ts, ts, ...] (last 24h only)
+        self._rate_limit_lock = threading.RLock()
+        self._in_flight: Dict[str, float] = {}            # user_id -> start_ts
+        self._in_flight_lock = threading.RLock()
 
     # ---- Public-ish helpers (exposed for tests) -------------------------
 
@@ -225,3 +247,87 @@ class ShelfScanService:
 
         preview_url = f"/uploads/scans/{scan_id}.jpg"
         return resized_bytes, preview_url
+
+    # ---- Scan store ---------------------------------------------------
+
+    def _save_scan(self, scan_id: str, user_id: str, candidates: list,
+                   preview_url: str = "", summary: dict | None = None) -> None:
+        now = time.time()
+        with self._scan_store_lock:
+            # Sweep expired entries opportunistically.
+            for k in list(self._scan_store.keys()):
+                if self._scan_store[k]["expires_at"] < now:
+                    self._scan_store.pop(k, None)
+            self._scan_store[scan_id] = {
+                "user_id": user_id,
+                "candidates": candidates,
+                "preview_url": preview_url,
+                "summary": summary or {},
+                "expires_at": now + SCAN_STORE_TTL_SECONDS,
+            }
+
+    def get_scan(self, scan_id: str, user_id: str) -> dict | None:
+        with self._scan_store_lock:
+            entry = self._scan_store.get(scan_id)
+            if not entry:
+                return None
+            if entry["user_id"] != user_id:
+                return None
+            if entry["expires_at"] < time.time():
+                self._scan_store.pop(scan_id, None)
+                return None
+            return entry
+
+    def discard_scan(self, scan_id: str, user_id: str) -> bool:
+        with self._scan_store_lock:
+            entry = self._scan_store.get(scan_id)
+            if not entry or entry["user_id"] != user_id:
+                return False
+            self._scan_store.pop(scan_id, None)
+        # Remove preview file if present (best-effort).
+        try:
+            preview_path = os.path.join(self._uploads_dir(), f"{scan_id}.jpg")
+            if os.path.exists(preview_path):
+                os.unlink(preview_path)
+        except Exception:
+            logger.exception("shelf_scan: failed to remove preview file %s", scan_id)
+        return True
+
+    # ---- Rate limiter --------------------------------------------------
+
+    def _record_scan_for_rate_limit(self, user_id: str) -> None:
+        """Record a scan in the rate-limit window, raising if over the cap.
+
+        Imported limits read from the module-level DAILY_SCAN_LIMIT_PER_USER
+        so tests can monkeypatch.
+        """
+        from app.services import shelf_scan_service as _module
+        limit = _module.DAILY_SCAN_LIMIT_PER_USER
+        now = time.time()
+        with self._rate_limit_lock:
+            entries = self._rate_limit.get(user_id, [])
+            # Drop entries older than the rate-limit window.
+            entries = [ts for ts in entries if now - ts < RATE_LIMIT_WINDOW_SECONDS]
+            if len(entries) >= limit:
+                self._rate_limit[user_id] = entries
+                raise ShelfScanRateLimited(
+                    f"Daily scan limit ({limit}) reached. Try again later."
+                )
+            entries.append(now)
+            self._rate_limit[user_id] = entries
+
+    # ---- In-flight tracking -------------------------------------------
+
+    def _mark_scan_in_flight(self, user_id: str) -> None:
+        now = time.time()
+        with self._in_flight_lock:
+            existing_ts = self._in_flight.get(user_id)
+            if existing_ts is not None and now - existing_ts < IN_FLIGHT_TTL_SECONDS:
+                raise ShelfScanInProgress(
+                    "A scan is already in progress for this user. Please wait."
+                )
+            self._in_flight[user_id] = now
+
+    def _clear_scan_in_flight(self, user_id: str) -> None:
+        with self._in_flight_lock:
+            self._in_flight.pop(user_id, None)
