@@ -317,3 +317,125 @@ def test_scan_id_isolation_between_users(kuzu_seeded, service, tmp_path):
     assert service.get_scan(result["scan_id"], ids["user_bob"]) is None
     # Alice can.
     assert service.get_scan(result["scan_id"], ids["user_alice"]) is not None
+
+
+# ---- Task 9: start_bulk_add_async + bulk-add worker ----------------------
+
+def test_bulk_add_creates_books_and_returns_task_id(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    # Stash a scan with two candidates.
+    candidates = [
+        {
+            "detection_id": "det_001",
+            "matched": True,
+            "best_match": {
+                "title": "BulkBook 1", "authors": ["A"], "isbn13": "9999000001", "isbn10": None,
+                "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+                "description": "", "similarity_score": 0.9,
+            },
+            "alternatives": [],
+        },
+        {
+            "detection_id": "det_002",
+            "matched": True,
+            "best_match": {
+                "title": "BulkBook 2", "authors": ["B"], "isbn13": "9999000002", "isbn10": None,
+                "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+                "description": "", "similarity_score": 0.9,
+            },
+            "alternatives": [],
+        },
+    ]
+    service._save_scan("test_scan_bulk", ids["user_newbie"], candidates)
+
+    with patch.object(service, "_create_and_link_book") as cl:
+        cl.side_effect = ["book_id_1", "book_id_2"]
+        task_id = service.start_bulk_add_async(
+            user_id=ids["user_newbie"],
+            scan_id="test_scan_bulk",
+            picked=["det_001", "det_002"],
+            overrides={},
+        )
+    assert task_id is not None
+    # Wait briefly for the worker thread to finish.
+    _time.sleep(0.5)
+    from app.utils.safe_import_manager import safe_get_import_job
+    job = safe_get_import_job(ids["user_newbie"], task_id)
+    assert job is not None
+    assert job["status"] == "completed"
+    assert job["success"] == 2
+    assert job["source"] == "shelf_scan"
+
+
+def test_bulk_add_continues_on_per_book_failure(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    candidates = [
+        {"detection_id": "ok", "matched": True, "best_match": {
+            "title": "Good", "authors": [], "isbn13": "G", "isbn10": None,
+            "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+            "description": "", "similarity_score": 0.9,
+        }, "alternatives": []},
+        {"detection_id": "bad", "matched": True, "best_match": {
+            "title": "Bad", "authors": [], "isbn13": "B", "isbn10": None,
+            "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+            "description": "", "similarity_score": 0.9,
+        }, "alternatives": []},
+    ]
+    service._save_scan("test_scan_partial", ids["user_newbie"], candidates)
+
+    def fake_create(user_id, candidate_metadata):
+        if candidate_metadata["title"] == "Bad":
+            raise RuntimeError("simulated DB failure")
+        return "ok_id"
+
+    with patch.object(service, "_create_and_link_book", side_effect=fake_create):
+        task_id = service.start_bulk_add_async(
+            user_id=ids["user_newbie"],
+            scan_id="test_scan_partial",
+            picked=["ok", "bad"],
+            overrides={},
+        )
+    _time.sleep(0.5)
+    from app.utils.safe_import_manager import safe_get_import_job
+    job = safe_get_import_job(ids["user_newbie"], task_id)
+    assert job["status"] == "completed"
+    assert job["success"] == 1
+    assert job["errors"] == 1
+    assert len(job["error_messages"]) == 1
+
+
+def test_bulk_add_uses_override_alternative(kuzu_seeded, service):
+    _, ids = kuzu_seeded
+    candidate = {
+        "detection_id": "det_001",
+        "matched": True,
+        "best_match": {"title": "Default", "authors": [], "isbn13": "DEFAULT",
+                       "isbn10": None, "cover_url": "", "published_date": "",
+                       "page_count": None, "language": "en", "description": "",
+                       "similarity_score": 0.9},
+        "alternatives": [
+            {"title": "Alt0", "authors": [], "isbn13": "ALT0", "isbn10": None,
+             "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+             "description": "", "similarity_score": 0.85},
+            {"title": "Alt1", "authors": [], "isbn13": "ALT1", "isbn10": None,
+             "cover_url": "", "published_date": "", "page_count": None, "language": "en",
+             "description": "", "similarity_score": 0.80},
+        ],
+    }
+    service._save_scan("test_scan_override", ids["user_newbie"], [candidate])
+
+    captured = {}
+
+    def fake_create(user_id, candidate_metadata):
+        captured["isbn13"] = candidate_metadata["isbn13"]
+        return "ok"
+
+    with patch.object(service, "_create_and_link_book", side_effect=fake_create):
+        task_id = service.start_bulk_add_async(
+            user_id=ids["user_newbie"],
+            scan_id="test_scan_override",
+            picked=["det_001"],
+            overrides={"det_001": 1},   # 1 means alternatives[1]
+        )
+    _time.sleep(0.5)
+    assert captured["isbn13"] == "ALT1"

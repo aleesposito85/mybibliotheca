@@ -558,3 +558,196 @@ def scan_image_and_enrich_sync(
 # Patch the two new methods onto the class (avoids restructuring the file).
 ShelfScanService._user_owned_book_titles = _user_owned_book_titles
 ShelfScanService.scan_image_and_enrich_sync = scan_image_and_enrich_sync
+
+
+# ---- Task 9: bulk-add worker --------------------------------------------
+
+import threading as _threading
+import uuid as _uuid
+from datetime import datetime, timezone
+
+from app.utils.safe_import_manager import (
+    safe_create_import_job,
+    safe_get_import_job,
+    safe_update_import_job,
+)
+
+
+def _resolve_chosen_metadata(candidate: Dict[str, Any], overrides: Dict[str, int]) -> Dict[str, Any] | None:
+    """Pick the metadata dict the user committed to for this candidate.
+
+    overrides[detection_id] = N → use alternatives[N]; otherwise use best_match.
+    Returns None if the candidate has no usable metadata (e.g. unmatched).
+    """
+    det_id = candidate.get("detection_id")
+    n = overrides.get(det_id)
+    if n is not None:
+        try:
+            return candidate["alternatives"][int(n)]
+        except (KeyError, IndexError, ValueError):
+            pass
+    return candidate.get("best_match")
+
+
+def _create_and_link_book(self, user_id: str, candidate_metadata: Dict[str, Any]) -> str | None:
+    """Create the Book node + HAS_PERSONAL_METADATA edge with reading_status=library_only.
+
+    Returns the new book id (or None if creation failed). Callers
+    translate None → counted as an error.
+
+    Note: simplified_book_service lives at app.simplified_book_service
+    (NOT app.services.simplified_book_service) and exposes both async
+    and sync create methods. We use the *_sync* variant because this
+    method runs inside a worker thread, not an event loop.
+    """
+    from app.simplified_book_service import SimplifiedBookService, SimplifiedBook
+    from app.services.personal_metadata_service import PersonalMetadataService
+
+    book = SimplifiedBook(
+        title=candidate_metadata.get("title", ""),
+        authors=", ".join(candidate_metadata.get("authors") or []),
+        isbn=candidate_metadata.get("isbn13") or candidate_metadata.get("isbn10") or "",
+        isbn_13=candidate_metadata.get("isbn13") or "",
+        isbn_10=candidate_metadata.get("isbn10") or "",
+        description=candidate_metadata.get("description") or "",
+        cover_url=candidate_metadata.get("cover_url") or "",
+        language=candidate_metadata.get("language") or "en",
+        page_count=candidate_metadata.get("page_count"),
+        published_date=candidate_metadata.get("published_date") or "",
+    )
+    simplified_service = SimplifiedBookService()
+    book_id = simplified_service.create_standalone_book_sync(book)
+    if not book_id:
+        return None
+
+    # Link to the user's library with library_only status. The
+    # personal_metadata_service custom_updates dict is the right place
+    # for non-column fields like reading_status.
+    try:
+        PersonalMetadataService().update_personal_metadata(
+            user_id=user_id,
+            book_id=book_id,
+            custom_updates={"reading_status": "library_only"},
+        )
+    except Exception:
+        logger.exception("shelf_scan: failed to link %s to user %s", book_id, user_id)
+        # Book exists in graph but not linked — surface as an error
+        # so the user knows they need to add it manually. Counts as
+        # a failure for this candidate.
+        return None
+    return book_id
+
+
+def start_bulk_add_async(
+    self,
+    user_id: str,
+    scan_id: str,
+    picked: List[str],
+    overrides: Dict[str, int],
+) -> str:
+    """Kick off the background bulk-add. Returns the task_id immediately.
+
+    The route layer hands the task_id to the existing import progress
+    page (/import/progress/<task_id>) which polls safe_import_manager.
+    """
+    scan = self.get_scan(scan_id, user_id)
+    if not scan:
+        raise ShelfScanError("scan_id not found, expired, or not owned by user")
+
+    task_id = _uuid.uuid4().hex
+    job_data = {
+        "task_id": task_id,
+        "user_id": user_id,
+        "status": "pending",
+        "processed": 0,
+        "success": 0,
+        "errors": 0,
+        "skipped": 0,
+        "total": len(picked),
+        "current_book": None,
+        "error_messages": [],
+        "processed_books": [],
+        "source": "shelf_scan",
+        "scan_id": scan_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    safe_create_import_job(user_id, task_id, job_data)
+
+    thread = _threading.Thread(
+        target=self._bulk_add_worker,
+        args=(user_id, task_id, scan_id, picked, overrides),
+        daemon=True,
+        name=f"shelf-scan-bulk-{task_id[:8]}",
+    )
+    thread.start()
+    return task_id
+
+
+def _bulk_add_worker(
+    self,
+    user_id: str,
+    task_id: str,
+    scan_id: str,
+    picked: List[str],
+    overrides: Dict[str, int],
+) -> None:
+    """Background worker: iterate picked candidates, create books, log progress."""
+    scan = self.get_scan(scan_id, user_id)
+    if not scan:
+        safe_update_import_job(user_id, task_id, {"status": "failed",
+                                                  "error_messages": [{"error": "scan expired"}]})
+        return
+
+    # Index candidates by detection_id for O(1) lookup.
+    cand_by_id = {c["detection_id"]: c for c in scan["candidates"]}
+    successes = 0
+    errors: List[Dict[str, str]] = []
+
+    safe_update_import_job(user_id, task_id, {"status": "running"})
+
+    for det_id in picked:
+        candidate = cand_by_id.get(det_id)
+        if not candidate:
+            errors.append({"detection_id": det_id, "error": "detection_id not in scan"})
+            safe_update_import_job(user_id, task_id, {
+                "processed": successes + len(errors),
+                "errors": len(errors),
+                "error_messages": errors,
+            })
+            continue
+        metadata = _resolve_chosen_metadata(candidate, overrides)
+        if not metadata:
+            errors.append({"detection_id": det_id, "error": "no usable metadata"})
+            safe_update_import_job(user_id, task_id, {
+                "processed": successes + len(errors),
+                "errors": len(errors),
+                "error_messages": errors,
+            })
+            continue
+        try:
+            book_id = self._create_and_link_book(user_id, metadata)
+            if not book_id:
+                raise RuntimeError("create_standalone_book returned None")
+            successes += 1
+            safe_update_import_job(user_id, task_id, {
+                "processed": successes + len(errors),
+                "success": successes,
+                "current_book": metadata.get("title", ""),
+            })
+        except Exception as e:
+            logger.exception("shelf_scan: bulk-add failed for %s", det_id)
+            errors.append({"detection_id": det_id, "error": str(e)})
+            safe_update_import_job(user_id, task_id, {
+                "processed": successes + len(errors),
+                "errors": len(errors),
+                "error_messages": errors,
+            })
+
+    safe_update_import_job(user_id, task_id, {"status": "completed"})
+
+
+# Patch the bulk-add methods onto ShelfScanService.
+ShelfScanService._create_and_link_book = _create_and_link_book
+ShelfScanService.start_bulk_add_async = start_bulk_add_async
+ShelfScanService._bulk_add_worker = _bulk_add_worker
