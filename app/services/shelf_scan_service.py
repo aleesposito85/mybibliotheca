@@ -136,6 +136,13 @@ MAX_LONG_EDGE = 2048
 JPEG_QUALITY = 85
 # Allowed input formats per PIL.
 _ALLOWED_FORMATS = {"JPEG", "PNG", "WEBP"}
+# PIL bomb-check ceiling for the shelf scan path. Pillow's
+# DecompressionBombError fires at 2x ``Image.MAX_IMAGE_PIXELS``; the audit
+# set the global to 30M, which was hitting at 60M. Modern phone cameras
+# legitimately produce 48-200MP, so we lift the limit locally for the
+# scan operation only — we resize to ≤2048px immediately so the resident
+# image never exceeds ~12MP regardless of input size.
+SHELF_SCAN_MAX_IMAGE_PIXELS = int(os.environ.get("SHELF_SCAN_MAX_IMAGE_PIXELS", "250000000"))
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -239,33 +246,44 @@ class ShelfScanService:
 
         Raises ``ValueError`` for unsupported / corrupt image inputs.
         """
+        # Temporarily lift PIL's bomb-check ceiling for this operation. The
+        # global cap (set by image_processing.py) is intentionally 30M for
+        # cover-fetching attacker-controlled URLs; modern phone cameras
+        # legitimately produce 48-200MP for a single shelf photo, and we
+        # resize down to ≤2048px immediately so the resident image never
+        # exceeds ~12MP regardless of input.
+        saved_pixel_limit = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = SHELF_SCAN_MAX_IMAGE_PIXELS
         try:
-            with Image.open(io.BytesIO(image_bytes)) as probe:
-                probe.verify()
-        except (UnidentifiedImageError, Exception) as e:
-            raise ValueError(f"Invalid image data: {e}") from e
+            try:
+                with Image.open(io.BytesIO(image_bytes)) as probe:
+                    probe.verify()
+            except (UnidentifiedImageError, Exception) as e:
+                raise ValueError(f"Invalid image data: {e}") from e
 
-        # verify() consumed the file pointer; re-open for actual decode.
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-        except UnidentifiedImageError as e:
-            raise ValueError("Invalid image data") from e
+            # verify() consumed the file pointer; re-open for actual decode.
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+            except UnidentifiedImageError as e:
+                raise ValueError("Invalid image data") from e
 
-        if img.format not in _ALLOWED_FORMATS:
-            raise ValueError(f"Unsupported image format: {img.format!r}")
+            if img.format not in _ALLOWED_FORMATS:
+                raise ValueError(f"Unsupported image format: {img.format!r}")
 
-        # Resize so the longer edge is <= MAX_LONG_EDGE.
-        if max(img.size) > MAX_LONG_EDGE:
-            ratio = MAX_LONG_EDGE / max(img.size)
-            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-            img = img.resize(new_size, Image.LANCZOS)
+            # Resize so the longer edge is <= MAX_LONG_EDGE.
+            if max(img.size) > MAX_LONG_EDGE:
+                ratio = MAX_LONG_EDGE / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
 
-        # Always emit JPEG (smaller, lower bandwidth to LLMs).
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        out_buf = io.BytesIO()
-        img.save(out_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-        resized_bytes = out_buf.getvalue()
+            # Always emit JPEG (smaller, lower bandwidth to LLMs).
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            out_buf = io.BytesIO()
+            img.save(out_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            resized_bytes = out_buf.getvalue()
+        finally:
+            Image.MAX_IMAGE_PIXELS = saved_pixel_limit
 
         out_path = os.path.join(self._uploads_dir(), f"{scan_id}.jpg")
         with open(out_path, "wb") as f:
@@ -410,10 +428,26 @@ from app.services.ai_service import AIService
 
 
 def _load_ai_config() -> Dict[str, str]:
-    """Build the config dict AIService expects from env / app config."""
-    # Mirror the env-driven config used by other AIService callers
-    # (admin.load_ai_config does similar work). Kept local so we don't need
-    # to import admin (which has heavier deps).
+    """Resolve the AI config — admin UI overrides → .env → defaults.
+
+    Delegates to ``app.admin.load_ai_config`` (the canonical loader used by
+    the existing single-book extraction). It reads ``data/ai_config.json``
+    (admin UI), legacy ``data/ai_settings.json``, and ``.env`` with proper
+    precedence + a 5s in-process cache. We fall back to bare env vars only
+    if the admin loader is unavailable (e.g., outside an app context, like
+    in unit tests).
+    """
+    try:
+        from app.admin import load_ai_config as _canonical_load
+        cfg = _canonical_load()
+        # Defensive: ensure a string-keyed dict (the canonical impl returns
+        # exactly that, but be permissive for tests / monkey-patches).
+        if isinstance(cfg, dict):
+            return {str(k): str(v) for k, v in cfg.items() if v is not None}
+    except Exception:
+        # Outside an app context, or admin module not importable — fall
+        # through to the env-only read below.
+        logger.debug("shelf_scan: falling back to env-only AI config", exc_info=True)
     return {
         "AI_PROVIDER": os.environ.get("AI_PROVIDER", "ollama"),
         "OLLAMA_BASE_URL": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
