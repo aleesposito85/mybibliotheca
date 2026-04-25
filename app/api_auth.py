@@ -40,6 +40,33 @@ class APIToken:
         return secrets.compare_digest(computed_hash, hashed_token)
 
 
+def _bind_token_user():
+    """If API_TOKEN_USER_ID is configured, log that user in for the request.
+
+    This binds the validated token to a real user so that downstream code
+    referencing ``current_user.id`` doesn't land on the AnonymousUser proxy.
+    Returns True on successful bind, False otherwise.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    user_id = current_app.config.get('API_TOKEN_USER_ID')
+    if not user_id:
+        logger.warning("Bearer token accepted but API_TOKEN_USER_ID not configured — refusing.")
+        return False
+    try:
+        from .services import user_service
+        from flask_login import login_user
+        user = user_service.get_user_by_id_sync(str(user_id))
+        if not user:
+            logger.warning(f"API_TOKEN_USER_ID={user_id} does not resolve to a user — refusing.")
+            return False
+        login_user(user, remember=False)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to bind API token to user {user_id}: {e}")
+        return False
+
+
 def api_token_required(f):
     """
     Decorator for API endpoints that require token authentication.
@@ -50,85 +77,73 @@ def api_token_required(f):
     def decorated_function(*args, **kwargs):
         import logging
         logger = logging.getLogger(__name__)
-        
+
         # Check if this is an API request
         if request.path.startswith('/api/'):
             logger.info(f"API request to {request.path}")
             # First check for token authentication
             auth_header = request.headers.get('Authorization')
-            logger.info(f"Authorization header: {auth_header[:30] if auth_header else None}...")
-            
+
             if auth_header and auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-                logger.info(f"Extracted token: {token[:10]}...")
+                token = auth_header.split(' ', 1)[1]
                 if validate_api_token(token):
+                    # The token is shared; without a configured user binding we
+                    # cannot answer "whose data is this?" — refuse rather than
+                    # silently fall into an AnonymousUser proxy.
+                    if not _bind_token_user():
+                        return jsonify({'error': 'API token user not configured'}), 500
                     logger.info("Token validation successful, allowing access")
-                    # Token is valid, proceed with the request
                     return f(*args, **kwargs)
                 else:
                     logger.info("Token validation failed")
-                    # Invalid token
                     return jsonify({'error': 'Invalid API token'}), 401
-            
+
             # No token provided, check if there's an active session
-            # Use hasattr to avoid triggering unauthorized handler
-            logger.info("No Bearer token, checking session authentication")
             from flask_login import current_user
             try:
-                # Try to access current_user carefully
                 if hasattr(current_user, 'is_authenticated') and current_user.is_authenticated:
-                    logger.info("User authenticated via session, allowing access")
-                    # User is logged in via web interface, allow access
                     return f(*args, **kwargs)
             except Exception as e:
                 logger.info(f"Session check failed: {e}")
-            
-            logger.info("No authentication found, returning 401")
-            # No authentication provided
+
             return jsonify({
-                'error': 'Authentication required', 
+                'error': 'Authentication required',
                 'message': 'Provide API token via Authorization header or login via web interface',
                 'authentication_methods': [
                     'Bearer token in Authorization header',
                     'Session-based login via web interface'
                 ]
             }), 401
-        
+
         # For non-API requests, fall back to regular authentication check
         from flask_login import current_user
         if not current_user.is_authenticated:
             return jsonify({'error': 'Authentication required'}), 401
-        
+
         return f(*args, **kwargs)
-    
+
     return decorated_function
 
 
 def validate_api_token(token: str) -> bool:
-    """
-    Validate an API token.
-    For now, this is a simple implementation.
-    In production, you'd check against stored tokens in database.
+    """Validate an API token against the configured value.
+
+    Fails closed: if no API_TEST_TOKEN is configured the API rejects every
+    bearer token. This removes the previous hardcoded ``dev-token-12345``
+    fallback that would have granted full access if any deployment ever set
+    the env var to that literal value.
     """
     import logging
     logger = logging.getLogger(__name__)
-    
-    # Simple validation for development
-    # In production, implement proper token storage and validation
-    logger.info(f"validate_api_token called with token: {token[:10] if token else None}...")
-    
+
     if not token:
-        logger.info("No token provided")
         return False
-    
-    # For development, accept a hardcoded test token
-    # TODO: Replace with proper database-backed token validation
-    test_token = current_app.config.get('API_TEST_TOKEN', 'dev-token-12345')
-    logger.info(f"Comparing with test_token: {test_token[:10]}...")
-    
-    result = secrets.compare_digest(token, test_token)
-    logger.info(f"Token validation result: {result}")
-    return result
+
+    expected = current_app.config.get('API_TEST_TOKEN')
+    if not expected:
+        logger.warning("API_TEST_TOKEN not configured — bearer-token auth disabled.")
+        return False
+    return secrets.compare_digest(token, expected)
 
 
 def api_auth_optional(f):
@@ -140,13 +155,14 @@ def api_auth_optional(f):
     def decorated_function(*args, **kwargs):
         # Check for API token
         auth_header = request.headers.get('Authorization')
-        
+
         if auth_header and auth_header.startswith('Bearer '):
-            token = auth_header.split(' ')[1]
+            token = auth_header.split(' ', 1)[1]
             if not validate_api_token(token):
                 return jsonify({'error': 'Invalid API token'}), 401
-        
+            _bind_token_user()  # best-effort; optional auth tolerates anon
+
         # Proceed regardless of authentication status
         return f(*args, **kwargs)
-    
+
     return decorated_function

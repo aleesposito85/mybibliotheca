@@ -73,6 +73,28 @@ def deterministic_series_id(name: str) -> str:
     h = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:20]
     return f"series_{h}"
 
+def _ensure_series_schema(conn) -> None:
+    """Idempotently add Series properties / PART_OF_SERIES.volume_number_double.
+
+    Older deployments lack `cover_url`, `custom_cover`, `generated_placeholder`
+    on the Series node and `volume_number_double` on the relationship — the
+    migration's CREATE referenced them, which crashed on the very first run.
+    Run additive ALTERs in a try/except so each statement is best-effort.
+    """
+    additive_statements = [
+        "ALTER TABLE Series ADD cover_url STRING DEFAULT NULL",
+        "ALTER TABLE Series ADD custom_cover BOOLEAN DEFAULT false",
+        "ALTER TABLE Series ADD generated_placeholder BOOLEAN DEFAULT false",
+        "ALTER TABLE PART_OF_SERIES ADD volume_number_double DOUBLE DEFAULT NULL",
+    ]
+    for stmt in additive_statements:
+        try:
+            conn.execute(stmt)
+        except Exception:
+            # Property already exists or table not yet created — skip silently.
+            pass
+
+
 def run_series_migration(verbose: bool = False) -> dict:
     mgr = get_safe_kuzu_manager()
     result_summary = {
@@ -88,6 +110,7 @@ def run_series_migration(verbose: bool = False) -> dict:
         result_summary["skipped"] = True
         return result_summary
     with mgr.get_connection(operation="series_migration") as conn:
+        _ensure_series_schema(conn)
         # If any PART_OF_SERIES exists, assume migration previously done
         try:
             rel_check_raw = conn.execute("MATCH ()-[r:PART_OF_SERIES]->() RETURN COUNT(r) as c LIMIT 1")
@@ -178,10 +201,18 @@ def run_series_migration(verbose: bool = False) -> dict:
                 sid = created_series_norms[norm]
             # Relationship
             vol_num = parse_volume(volume_raw)
+            # Only assign volume_number (INT64) when the parsed value is an
+            # integer. Casting `2.5 -> 2` collides half-volumes with whole
+            # volumes; preserve the precise value via volume_number_double.
+            int_vol = (
+                int(vol_num)
+                if (vol_num is not None and float(vol_num).is_integer())
+                else None
+            )
             params = {
                 "bid": book_id,
                 "sid": sid,
-                "vol": int(vol_num) if (vol_num is not None) else None,
+                "vol": int_vol,
                 "vol_d": vol_num,
                 "ord": series_order if isinstance(series_order, (int, float)) else None,
                 "ts": datetime.now(timezone.utc)

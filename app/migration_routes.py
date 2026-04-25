@@ -165,9 +165,9 @@ def execute_migration():
         return redirect(url_for('migration.migration_wizard'))
     
     try:
-        with open(config_file, 'r') as f:
+        with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        
+
         # Create a unique migration ID for tracking
         migration_id = f"migration_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
@@ -189,90 +189,30 @@ def run_migration(migration_id):
             return jsonify({'error': 'No JSON data provided'}), 400
             
         config_file = request.json.get('config_file')
-        
+
         if not config_file or not os.path.exists(config_file):
             return jsonify({'error': 'Configuration file not found'}), 400
-        
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-        
-        # Import the simplified migration script functionality
-        import sys
-        scripts_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts')
-        sys.path.append(scripts_path)
-        
-        # Legacy migration script - users start fresh with Kuzu
-        return jsonify({
-            'success': False,
-            'error': 'Redis migration is no longer supported. Users start fresh with Kuzu database.',
-            'results': []
-        })
-        total_migrated = 0
-        
-        # Use current user ID directly from session
-        current_user_id = current_user.id
-        logger.info(f"🚀 Starting migration for user: {current_user.username} (ID: {current_user_id})")
-        
-        for db_path in config['databases']:
-            try:
-                # Create simplified migrator instance
-                migrator = WebBasedSQLiteToRedisMigrator(
-                    db_path=db_path,
-                    target_user_id=current_user_id  # Direct from Flask session
-                )
-                
-                # Run migration
-                success = migrator.run_migration()
-                
-                if success:
-                    # Get migration stats from the migrator
-                    results.append({
-                        'database': os.path.basename(db_path),
-                        'success': True,
-                        'books_migrated': migrator.stats['books_migrated'],
-                        'reading_logs_migrated': migrator.stats['reading_logs_migrated'],
-                        'relationships_created': migrator.stats['relationships_created']
-                    })
-                    total_migrated += migrator.stats['books_migrated']
-                else:
-                    results.append({
-                        'database': os.path.basename(db_path),
-                        'success': False,
-                        'error': 'Migration failed - check logs for details'
-                    })
-                
-                # Handle backup and deletion options
-                if success and config['delete_after_migration']:
-                    try:
-                        os.unlink(db_path)
-                    except Exception as e:
-                        logger.warning(f"Could not delete original database: {e}")
-                
-            except Exception as db_error:
-                results.append({
-                    'database': os.path.basename(db_path),
-                    'success': False,
-                    'error': str(db_error)
-                })
-        
-        # Clean up config file
+
         try:
-            os.unlink(config_file)
-        except:
-            pass
-        
-        # Mark migration as completed to prevent redirect loops
-        from flask import session
-        session['migration_dismissed'] = True
-        
-        return jsonify({
-            'success': True,
-            'results': results,
-            'total_migrated': total_migrated,
-            'migrated_to_user': current_user.username
-        })
-    
+            # Read & validate the config (we still want a clean error if it's malformed),
+            # but the legacy SQLite→Redis migration is no longer supported.
+            with open(config_file, 'r', encoding='utf-8') as f:
+                json.load(f)
+
+            return jsonify({
+                'success': False,
+                'error': 'Redis migration is no longer supported. Users start fresh with Kuzu database.',
+                'results': []
+            })
+        finally:
+            # Always remove the temp config file so it doesn't leak in /tmp.
+            try:
+                os.unlink(config_file)
+            except OSError:
+                pass
+
     except Exception as e:
+        logger.exception("Error in run_migration")
         return jsonify({
             'success': False,
             'error': str(e)

@@ -16,6 +16,10 @@ from flask import current_app
 
 MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB safety ceiling
 
+# Cap decoded pixel count at ~30MP to prevent decompression-bomb DoS:
+# a small file declaring 50000x50000 dims would otherwise allocate gigabytes.
+Image.MAX_IMAGE_PIXELS = 30_000_000
+
 
 
 def _get_base_dir() -> Path:
@@ -79,18 +83,45 @@ def _prepare_image(img: Image.Image, out_fmt: str) -> Image.Image:
     return img
 
 
+def _is_disallowed_ip(ip_obj: "ipaddress._BaseAddress") -> bool:
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
 def ensure_safe_remote_image_url(url: str) -> str:
     """Validate that a remote image URL is safe to fetch.
 
     - Must be http/https with hostname.
     - Host must not resolve to private, loopback, multicast, or link-local ranges.
+    - If the hostname is itself an IP literal, it is checked directly so
+      attackers can't sneak through name-based allowlists.
     Raises ValueError if the URL is unsafe.
+
+    NOTE: This does *not* fix DNS rebinding by itself — the actual fetch must
+    pin to the IP we resolved here. Callers should pass `pinned_addr` from
+    :func:`resolve_safe_addr` to a custom transport. ``process_image_from_url``
+    below uses that pattern.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ('http', 'https'):
         raise ValueError("Cover URL must use http or https scheme")
     if not parsed.hostname:
         raise ValueError("Cover URL must include a hostname")
+
+    # Hostname as IP literal — check directly.
+    try:
+        ip_literal = ipaddress.ip_address(parsed.hostname)
+        if _is_disallowed_ip(ip_literal):
+            raise ValueError("Cover URL resolves to a disallowed network range")
+        return url
+    except ValueError:
+        pass  # not an IP literal — fall through to DNS resolution
 
     try:
         addr_info = socket.getaddrinfo(parsed.hostname, None)
@@ -100,10 +131,38 @@ def ensure_safe_remote_image_url(url: str) -> str:
     for info in addr_info:
         ip_str = info[4][0]
         ip_obj = ipaddress.ip_address(ip_str)
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved:
+        if _is_disallowed_ip(ip_obj):
             raise ValueError("Cover URL resolves to a disallowed network range")
 
     return url
+
+
+def resolve_safe_addr(host: str) -> str:
+    """Resolve a hostname to an IP and verify it's not in a private range.
+
+    Returned IP should be passed to a transport that connects directly,
+    avoiding a second DNS lookup that an attacker could rebind.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if _is_disallowed_ip(ip_obj):
+            raise ValueError("Host is in a disallowed network range")
+        return str(ip_obj)
+    except ValueError:
+        pass
+
+    try:
+        addr_info = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Unable to resolve host: {host}") from exc
+
+    for info in addr_info:
+        ip_str = info[4][0]
+        ip_obj = ipaddress.ip_address(ip_str)
+        if _is_disallowed_ip(ip_obj):
+            raise ValueError("Host resolves to a disallowed network range")
+        return ip_str
+    raise ValueError(f"No A/AAAA record for host: {host}")
 
 
 def process_image_bytes_and_store(image_bytes: bytes, filename_hint: str | None = None) -> str:
@@ -112,7 +171,23 @@ def process_image_bytes_and_store(image_bytes: bytes, filename_hint: str | None 
     Returns the relative URL like "/covers/<uuid>.jpg|.png".
     """
     covers_dir = get_covers_dir()
-    with Image.open(BytesIO(image_bytes)) as img:
+    # Verify pass first — Image.verify() catches malformed / decompression-bomb
+    # input cheaply. After verify(), the file pointer is consumed, so re-open
+    # for the actual decode.
+    try:
+        with Image.open(BytesIO(image_bytes)) as probe:
+            probe.verify()
+    except Image.DecompressionBombError as e:
+        raise ValueError("Image rejected: declared pixel count exceeds the safe limit") from e
+    except Exception as e:
+        raise ValueError(f"Invalid image data: {e}") from e
+
+    try:
+        img = Image.open(BytesIO(image_bytes))
+    except Image.DecompressionBombError as e:
+        raise ValueError("Image rejected: declared pixel count exceeds the safe limit") from e
+
+    with img:
         out_fmt, out_ext = _choose_format(img.mode, img.format)
         img_resized = _resize_high_quality(img)
         img_prepared = _prepare_image(img_resized, out_fmt)
@@ -153,7 +228,18 @@ def process_image_from_url(
 
     parsed = urlparse(url)
     # Handle loopback self-call that would deadlock (single worker). Convert to direct file access.
-    if parsed.scheme in ('http', 'https') and parsed.hostname in ('127.0.0.1', 'localhost', '0.0.0.0') and '/covers/' in parsed.path:
+    # Cover all loopback variants — IPv4, IPv6 [::1], and explicit 127.x ranges.
+    def _is_loopback_host(h: Optional[str]) -> bool:
+        if not h:
+            return False
+        if h in ('localhost', '0.0.0.0'):
+            return True
+        try:
+            return ipaddress.ip_address(h.strip('[]')).is_loopback
+        except ValueError:
+            return False
+
+    if parsed.scheme in ('http', 'https') and _is_loopback_host(parsed.hostname) and '/covers/' in parsed.path:
         # Derive filename and confirm exists
         covers_dir = get_covers_dir()
         fname = parsed.path.split('/covers/')[-1]
@@ -165,6 +251,29 @@ def process_image_from_url(
 
     ensure_safe_remote_image_url(url)
 
+    # DNS-rebinding mitigation: resolve once, then ask requests to connect to
+    # the IP we just verified — but keep the original Host header so TLS / vhost
+    # routing still work. Without this, a name that first resolved to a public
+    # IP could re-resolve to 169.254.169.254 between our check and the GET.
+    pinned_ip = None
+    try:
+        pinned_ip = resolve_safe_addr(parsed.hostname)
+    except ValueError:
+        # ensure_safe_remote_image_url would have already raised; safe fallback.
+        pass
+
+    fetch_url = url
+    custom_headers = dict(headers or {})
+    if pinned_ip and parsed.hostname and pinned_ip != parsed.hostname:
+        # Replace the hostname with the pinned IP. Set Host: header to preserve
+        # vhost-based routing on the server. For HTTPS we keep the original
+        # hostname in the URL so SNI / cert validation still match — only
+        # rewrite for plain HTTP where rebinding risk is highest.
+        if parsed.scheme == 'http':
+            netloc = pinned_ip if not parsed.port else f"{pinned_ip}:{parsed.port}"
+            fetch_url = parsed._replace(netloc=netloc).geturl()
+            custom_headers.setdefault('Host', parsed.hostname)
+
     start_total = time.perf_counter()
     current_app.logger.info(f"[COVER][DL] Start url={url}")
     dl_start = time.perf_counter()
@@ -172,32 +281,32 @@ def process_image_from_url(
     request_kwargs: Dict[str, Any] = {"timeout": 6, "stream": True}
     if auth is not None:
         request_kwargs["auth"] = auth
-    if headers:
-        request_kwargs["headers"] = headers
-    resp = requests.get(url, **request_kwargs)
-    resp.raise_for_status()
-    content_length = resp.headers.get('Content-Length')
-    if content_length:
-        try:
-            if int(content_length) > MAX_REMOTE_IMAGE_BYTES:
-                resp.close()
-                raise ValueError("Remote image exceeds maximum allowed size")
-        except ValueError as err:
-            resp.close()
-            raise ValueError("Invalid Content-Length header for remote image") from err
-    dl_time = time.perf_counter() - dl_start
-    buf = BytesIO()
-    copy_start = time.perf_counter()
-    total_bytes = 0
-    for chunk in resp.iter_content(chunk_size=16384):
-        if not chunk:
-            continue
-        buf.write(chunk)
-        total_bytes += len(chunk)
-        if total_bytes > MAX_REMOTE_IMAGE_BYTES:
-            resp.close()
-            raise ValueError("Remote image download exceeded maximum allowed size")
-    copy_time = time.perf_counter() - copy_start
+    if custom_headers:
+        request_kwargs["headers"] = custom_headers
+
+    # Use ``with`` so the connection is always returned to the pool, even if
+    # subsequent processing raises.
+    with requests.get(fetch_url, **request_kwargs) as resp:
+        resp.raise_for_status()
+        content_length = resp.headers.get('Content-Length')
+        if content_length:
+            try:
+                if int(content_length) > MAX_REMOTE_IMAGE_BYTES:
+                    raise ValueError("Remote image exceeds maximum allowed size")
+            except ValueError as err:
+                raise ValueError("Invalid Content-Length header for remote image") from err
+        dl_time = time.perf_counter() - dl_start
+        buf = BytesIO()
+        copy_start = time.perf_counter()
+        total_bytes = 0
+        for chunk in resp.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            buf.write(chunk)
+            total_bytes += len(chunk)
+            if total_bytes > MAX_REMOTE_IMAGE_BYTES:
+                raise ValueError("Remote image download exceeded maximum allowed size")
+        copy_time = time.perf_counter() - copy_start
     proc_start = time.perf_counter()
     out_url = process_image_bytes_and_store(buf.getvalue())
     proc_time = time.perf_counter() - proc_start

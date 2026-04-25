@@ -350,7 +350,7 @@ class AdvancedMigrationSystem:
             logger.warning(f"Could not backup Kuzu data: {e}")
             backup_data['error'] = str(e)
         
-        with open(backup_path, 'w') as f:
+        with open(backup_path, 'w', encoding='utf-8') as f:
             json.dump(backup_data, f, indent=2)
     
     def create_first_admin_user(self, username: str, email: str, password: str) -> Optional[User]:
@@ -537,14 +537,16 @@ class AdvancedMigrationSystem:
                                 from datetime import datetime
                                 log_date = datetime.strptime(log_date, '%Y-%m-%d').date()
                             
-                            # Create ReadingLog domain object
+                            # Create ReadingLog domain object — default to 0 for
+                            # missing metrics; defaulting to 1 invented data
+                            # ("read 1 page") for every legacy log.
                             reading_log = ReadingLog(
                                 user_id=admin_user_id,
                                 book_id=new_book_id,
                                 date=log_date,
-                                pages_read=safe_get(log_row, 'pages_read', 1),  # Default 1 page if not in SQLite
-                                minutes_read=safe_get(log_row, 'minutes_read', 1),  # Default 1 minute if not in SQLite
-                                notes=safe_get(log_row, 'notes', '')  # Empty notes if not in SQLite
+                                pages_read=safe_get(log_row, 'pages_read', 0),
+                                minutes_read=safe_get(log_row, 'minutes_read', 0),
+                                notes=safe_get(log_row, 'notes', '')
                             )
                             
                             # Create the reading log in Kuzu
@@ -663,6 +665,7 @@ class AdvancedMigrationSystem:
             
             book_id_mapping = {}  # Map old book IDs to new ones
             created_books = set()  # Track books we've already created (avoid duplicates)
+            identifier_to_new_id = {}  # identifier -> new book id, for de-dup mapping
             
             for book_row in books:
                 try:
@@ -689,20 +692,18 @@ class AdvancedMigrationSystem:
                         created_book_id = getattr(created_book, 'id', None) if created_book else None
                         if created_book and created_book_id:
                             created_books.add(book_identifier)
+                            identifier_to_new_id[book_identifier] = created_book_id
                             book_id_mapping[book_row['id']] = created_book_id
                             self.stats['books_migrated'] += 1
-                            
-                            # Don't assign to admin location here - books will be assigned to 
+
+                            # Don't assign to admin location here - books will be assigned to
                             # their original users later based on user_id in reading data
                         else:
                             self._log_error(f"Failed to create global book '{book.title}'")
                     else:
-                        # Book already exists, just map the ID
-                        existing_book_id = None
-                        for old_id, new_id in book_id_mapping.items():
-                            if book_identifier in created_books:
-                                existing_book_id = new_id
-                                break
+                        # Book already exists — look up the new id by identifier so
+                        # we don't bind every duplicate to the same arbitrary book.
+                        existing_book_id = identifier_to_new_id.get(book_identifier)
                         if existing_book_id:
                             book_id_mapping[book_row['id']] = existing_book_id
                     
@@ -810,14 +811,15 @@ class AdvancedMigrationSystem:
                                 from datetime import datetime
                                 log_date = datetime.strptime(log_date, '%Y-%m-%d').date()
                             
-                            # Create ReadingLog domain object
+                            # Create ReadingLog domain object — see note above:
+                            # default to 0 instead of inventing 1 page/min.
                             reading_log = ReadingLog(
                                 user_id=target_user_id,
                                 book_id=new_book_id,
                                 date=log_date,
-                                pages_read=safe_get(log_row, 'pages_read', 1),  # Default 1 page if not in SQLite
-                                minutes_read=safe_get(log_row, 'minutes_read', 1),  # Default 1 minute if not in SQLite
-                                notes=safe_get(log_row, 'notes', '')  # Empty notes if not in SQLite
+                                pages_read=safe_get(log_row, 'pages_read', 0),
+                                minutes_read=safe_get(log_row, 'minutes_read', 0),
+                                notes=safe_get(log_row, 'notes', '')
                             )
                             
                             # Create the reading log in Kuzu

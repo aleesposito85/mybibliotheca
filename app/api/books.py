@@ -92,25 +92,25 @@ def serialize_book(domain_book):
 
 def parse_book_data(data):
     """Parse JSON data into domain book object."""
-    # Parse contributors (authors)
+    # Parse contributors (authors) — defensively handle None / non-string entries
     contributors = []
-    if 'authors' in data and data['authors']:
-        if isinstance(data['authors'], list):
-            for i, name in enumerate(data['authors']):
-                if name.strip():
-                    # Create Person for author
-                    person = Publisher(name=name.strip())  # Temporary use of Publisher as Person-like
-                    # Create BookContribution
-                    contribution = BookContribution(
-                        person_id=str(person),  # Temporary
-                        book_id="",  # Will be set later
-                        contribution_type=ContributionType.AUTHORED,
-                        order=i
-                    )
-                    contributors.append(contribution)
-        else:
+    raw_authors = data.get('authors')
+    if raw_authors:
+        if isinstance(raw_authors, list):
+            for i, name in enumerate(raw_authors):
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                person = Publisher(name=name.strip())  # Temporary use of Publisher as Person-like
+                contribution = BookContribution(
+                    person_id=str(person),
+                    book_id="",
+                    contribution_type=ContributionType.AUTHORED,
+                    order=i
+                )
+                contributors.append(contribution)
+        elif isinstance(raw_authors, str) and raw_authors.strip():
             # Single author
-            person = Publisher(name=data['authors'].strip())  # Temporary
+            person = Publisher(name=raw_authors.strip())
             contribution = BookContribution(
                 person_id=str(person),
                 book_id="",
@@ -285,11 +285,70 @@ def update_book(book_id):
             }), 400
         
         data = request.json
-        data['id'] = book_id  # Ensure ID is set
-        
-        # Get the updates as a dictionary (excluding domain-specific parsing for now)
-        updates = {k: v for k, v in data.items() if k != 'id'}
-        
+
+        # Whitelist + type-coerce: never forward raw JSON straight to the DB layer.
+        # See parse_book_data() above for the canonical create-time coercion.
+        SCALAR_FIELDS = {
+            'title', 'subtitle', 'description', 'isbn13', 'isbn10', 'asin',
+            'language', 'cover_url', 'google_books_id', 'openlibrary_id',
+            'series_volume',
+        }
+        INT_FIELDS = {'page_count', 'rating_count', 'series_order'}
+        FLOAT_FIELDS = {'average_rating'}
+        # Personal/relationship fields that update_book_sync routes itself.
+        RELATIONSHIP_FIELDS = {
+            'reading_status', 'ownership_status', 'user_rating',
+            'personal_notes', 'review', 'start_date', 'finish_date',
+            'custom_metadata', 'location_id', 'primary_location_id',
+            'locations', 'contributors', 'raw_categories', 'categories',
+        }
+        DATE_FIELDS = {'published_date', 'start_date', 'finish_date'}
+
+        def _coerce(field, value):
+            if value is None:
+                return None
+            if field in DATE_FIELDS and isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value).date()
+                except (ValueError, TypeError):
+                    raise ValueError(f"Invalid {field}: expected ISO date string")
+            if field in INT_FIELDS:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid {field}: expected integer")
+            if field in FLOAT_FIELDS:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid {field}: expected number")
+            if field in SCALAR_FIELDS and not isinstance(value, str):
+                raise ValueError(f"Invalid {field}: expected string")
+            return value
+
+        updates = {}
+        for k, v in data.items():
+            if k == 'id':
+                continue
+            if k == 'authors':
+                # Contributors must go via parse_book_data; expose only via
+                # 'contributors' on this endpoint to keep types consistent.
+                continue
+            if k == 'publisher':
+                if v is None:
+                    updates['publisher'] = None
+                elif isinstance(v, str):
+                    updates['publisher'] = Publisher(name=v.strip()) if v.strip() else None
+                else:
+                    return jsonify({'status': 'error', 'message': 'publisher must be a string'}), 400
+                continue
+            if k in SCALAR_FIELDS or k in INT_FIELDS or k in FLOAT_FIELDS or k in DATE_FIELDS or k in RELATIONSHIP_FIELDS:
+                try:
+                    updates[k] = _coerce(k, v)
+                except ValueError as ve:
+                    return jsonify({'status': 'error', 'message': str(ve)}), 400
+            # Unknown keys are silently ignored — never let them reach the DB layer.
+
         # Update book using KuzuBookService
         updated_book = kuzu_book_service.update_book_sync(book_id, current_user.id, **updates)
         

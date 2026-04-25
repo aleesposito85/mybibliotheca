@@ -107,8 +107,19 @@ def save_abs_settings(update: Dict[str, Any]) -> bool:
             if key in update:
                 update[key] = _to_bool(update.get(key))
         current.update(update or {})
-        with open(path, 'w') as f:
+        # Atomic write + chmod 0600. This file holds the ABS api_key.
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(current, f, indent=2)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return True
     except Exception:
         return False

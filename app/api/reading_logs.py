@@ -86,10 +86,38 @@ def get_reading_logs():
                     'message': 'Invalid end_date format. Use YYYY-MM-DD'
                 }), 400
         
-        # For now, return empty list since we need to implement get_reading_logs in service
-        # TODO: Implement get_reading_logs_sync in service layer
-        reading_logs = []
-        
+        # Pull a generous window from the service then apply explicit filters here.
+        # service.get_user_reading_logs_sync uses days_back; if a start_date is
+        # given, derive the matching window; otherwise fetch the default window.
+        if parsed_start_date:
+            days_back = max(1, (date.today() - parsed_start_date).days + 1)
+        else:
+            days_back = 365
+        raw_logs = reading_log_service.get_user_reading_logs_sync(
+            user_id=str(current_user.id),
+            days_back=days_back,
+            limit=None,
+        )
+
+        def _matches(log):
+            log_date = log.get('date')
+            if hasattr(log_date, 'isoformat'):
+                pass  # already a date
+            elif isinstance(log_date, str):
+                try:
+                    log_date = datetime.fromisoformat(log_date).date()
+                except ValueError:
+                    return False
+            if parsed_start_date and log_date and log_date < parsed_start_date:
+                return False
+            if parsed_end_date and log_date and log_date > parsed_end_date:
+                return False
+            if book_id and str(log.get('book_id') or (log.get('book') or {}).get('id') or '') != str(book_id):
+                return False
+            return True
+
+        reading_logs = [serialize_reading_log(l) for l in raw_logs if _matches(l)]
+
         return jsonify({
             'status': 'success',
             'data': reading_logs,
@@ -255,9 +283,16 @@ def check_existing_log():
 def delete_reading_log(log_id):
     """Delete a reading log entry."""
     try:
-        # For now, return success since delete isn't implemented in service yet
-        # TODO: Implement delete_reading_log_sync in service layer
-        
+        deleted = reading_log_service.delete_reading_log_sync(
+            log_id=str(log_id),
+            user_id=str(current_user.id),
+        )
+        if not deleted:
+            return jsonify({
+                'status': 'error',
+                'message': 'Reading log not found'
+            }), 404
+
         return jsonify({
             'status': 'success',
             'message': 'Reading log deleted successfully'

@@ -187,9 +187,13 @@ def view_location(location_id):
                 book = book_service.get_book_by_uid_sync(book_id, str(current_user.id))
                 if book:
                     books.append(book)
-            except Exception as e:
-                # Handle book retrieval error gracefully
-                pass
+            except Exception:
+                # Skip the bad row but make the failure visible — silently
+                # eating it made location-view bugs hard to diagnose.
+                from flask import current_app
+                current_app.logger.exception(
+                    "Failed to load book %s for location view", book_id
+                )
     
     # Get book count
     book_count = location_service.get_location_book_count(location_id, str(current_user.id))
@@ -229,4 +233,6 @@ def api_set_book_location():
             return jsonify({'success': False, 'error': 'Failed to update book location'}), 500
         
     except Exception as e:
+        from flask import current_app
+        current_app.logger.exception("Error setting book location")
         return jsonify({'success': False, 'error': 'Server error'}), 500

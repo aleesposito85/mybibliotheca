@@ -74,9 +74,14 @@ def get_current_user():
 
 
 @users_api.route('/me', methods=['PUT'])
-@api_auth_optional
+@api_token_required
 def update_current_user():
-    """Update current user's profile and privacy settings."""
+    """Update current user's profile and privacy settings.
+
+    State-changing endpoints require an explicit API token; falling back to
+    session cookies here would let any logged-in user be CSRF'd into a
+    privacy-toggle change from a third-party origin.
+    """
     try:
         data = request.get_json()
         if not data:
@@ -124,25 +129,16 @@ def update_current_user():
         if 'share_library' in data:
             user.share_library = bool(data['share_library'])
         
-        # Use the user service to update the user
+        # Use the user service to update the user. Writes against the
+        # LocalProxy are never persisted, so failure here is fatal.
         try:
             user_service.update_user_sync(user)
         except Exception as update_error:
-            current_app.logger.error(f"Error updating user via service: {update_error}")
-            # Fallback - attempt to update the current_user proxy directly
-            try:
-                if hasattr(current_user, 'share_current_reading') and 'share_current_reading' in data:
-                    current_user.share_current_reading = bool(data['share_current_reading'])
-                if hasattr(current_user, 'share_reading_activity') and 'share_reading_activity' in data:
-                    current_user.share_reading_activity = bool(data['share_reading_activity'])
-                if hasattr(current_user, 'share_library') and 'share_library' in data:
-                    current_user.share_library = bool(data['share_library'])
-            except Exception as fallback_error:
-                current_app.logger.error(f"Fallback user update also failed: {fallback_error}")
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Failed to update user settings'
-                }), 500
+            current_app.logger.exception("Error updating user via service")
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to update user settings'
+            }), 500
         
         return jsonify({
             'status': 'success',
@@ -212,8 +208,17 @@ def get_user_library(user_id):
                 'message': 'User not found'
             }), 404
         
-        # Check if user allows library sharing
-        if not getattr(user, 'share_library', False) and user.id != current_user.id:
+        # Library disclosure rules:
+        #  - The owner can always see their own library.
+        #  - Admins can see any library.
+        #  - share_library=True permits *authenticated* viewers but not
+        #    anonymous bearer-token bots; keeping it private-by-default for
+        #    third parties prevents bulk scraping of users who flipped the
+        #    privacy toggle without realizing it was world-readable.
+        is_self = current_user.is_authenticated and str(user.id) == str(current_user.id)
+        is_admin = current_user.is_authenticated and getattr(current_user, 'is_admin', False)
+        share_ok = bool(getattr(user, 'share_library', False)) and current_user.is_authenticated
+        if not (is_self or is_admin or share_ok):
             return jsonify({
                 'status': 'error',
                 'message': 'User library is private'

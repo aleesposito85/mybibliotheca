@@ -40,6 +40,14 @@
     return 2;                   // xs
   }
 
+  function safeCoverUrl(u){
+    if(!u || typeof u !== 'string') return '/static/bookshelf.png';
+    // Allow only same-origin paths and explicit https URLs.
+    if(u.startsWith('/') && !u.startsWith('//')) return u;
+    if(u.startsWith('https://')) return u;
+    return '/static/bookshelf.png';
+  }
+
   function renderCard(book){
     const col = document.createElement('div');
     col.className = 'col-lg-2 col-md-3 col-sm-4 col-6 book-item';
@@ -56,22 +64,62 @@
     if(rs === 'finished' || rs === 'complete' || rs === 'completed') rs = 'read';
   col.dataset.readingStatus = rs;
     col.dataset.ownershipStatus = book.ownership_status || 'owned';
-    const checked = state.selected.has(String(book.id)) ? 'checked' : '';
-    col.innerHTML = `
-      <div class="card h-100 book-card shadow-sm position-relative" data-book-id="${book.id}">
-        <div class="position-absolute top-0 end-0 p-2" style="z-index:10; pointer-events: none;">
-          <input type="checkbox" class="form-check-input book-checkbox" value="${book.id}" ${checked} style="pointer-events:auto;">
-        </div>
-        <div class="book-cover-wrapper position-relative" style="cursor:pointer;">
-          <img alt="cover" class="card-img-top book-cover" loading="lazy" src="${book.cover_url || '/static/bookshelf.png'}" />
-        </div>
-        <div class="card-body p-2" style="cursor:pointer;">
-          <h6 class="card-title mb-1 book-title">${book.title || ''}</h6>
-          ${book.author ? `<div class=\"mb-1 small text-muted\">${book.author}</div>` : ''}
-        </div>
-        <a href="/view_book_enhanced/${book.id}" class="stretched-link" aria-label="View book"></a>
-      </div>
-    `;
+
+    // Build the card with safe DOM APIs (textContent / .src / .href) instead of
+    // innerHTML interpolation. Imported titles & authors are untrusted.
+    const bookId = String(book.id || '');
+    const card = document.createElement('div');
+    card.className = 'card h-100 book-card shadow-sm position-relative';
+    card.setAttribute('data-book-id', bookId);
+
+    const checkboxWrap = document.createElement('div');
+    checkboxWrap.className = 'position-absolute top-0 end-0 p-2';
+    checkboxWrap.style.zIndex = '10';
+    checkboxWrap.style.pointerEvents = 'none';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'form-check-input book-checkbox';
+    checkbox.value = bookId;
+    if(state.selected.has(bookId)) checkbox.checked = true;
+    checkbox.style.pointerEvents = 'auto';
+    checkboxWrap.appendChild(checkbox);
+
+    const coverWrap = document.createElement('div');
+    coverWrap.className = 'book-cover-wrapper position-relative';
+    coverWrap.style.cursor = 'pointer';
+    const img = document.createElement('img');
+    img.alt = 'cover';
+    img.className = 'card-img-top book-cover';
+    img.loading = 'lazy';
+    img.src = safeCoverUrl(book.cover_url);
+    coverWrap.appendChild(img);
+
+    const body = document.createElement('div');
+    body.className = 'card-body p-2';
+    body.style.cursor = 'pointer';
+    const title = document.createElement('h6');
+    title.className = 'card-title mb-1 book-title';
+    title.textContent = book.title || '';
+    body.appendChild(title);
+    if(book.author){
+      const authorDiv = document.createElement('div');
+      authorDiv.className = 'mb-1 small text-muted';
+      authorDiv.textContent = book.author;
+      body.appendChild(authorDiv);
+    }
+
+    const link = document.createElement('a');
+    link.className = 'stretched-link';
+    link.setAttribute('aria-label', 'View book');
+    // bookId is constrained to a stringified id; encodeURIComponent guards
+    // against a tampered numeric/string id with reserved chars.
+    link.href = '/view_book_enhanced/' + encodeURIComponent(bookId);
+
+    card.appendChild(checkboxWrap);
+    card.appendChild(coverWrap);
+    card.appendChild(body);
+    card.appendChild(link);
+    col.appendChild(card);
     return col;
   }
 

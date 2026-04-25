@@ -4,13 +4,17 @@ Separates book creation from user relationships for better persistence.
 """
 
 import os as _os_for_import_verbosity
+import builtins as _builtins
 _IMPORT_VERBOSE = (
     (_os_for_import_verbosity.getenv('VERBOSE') or 'false').lower() == 'true'
     or (_os_for_import_verbosity.getenv('IMPORT_VERBOSE') or 'false').lower() == 'true'
 )
 def _dprint(*args, **kwargs):
+    # ``__builtins__`` is a dict in non-__main__ modules and a module in
+    # __main__ — don't try to attribute-access it. Use the imported
+    # ``builtins`` module so this works regardless of how this file is loaded.
     if _IMPORT_VERBOSE:
-        __builtins__.print(*args, **kwargs)
+        _builtins.print(*args, **kwargs)
 
 # Redirect module print to conditional debug print
 print = _dprint
@@ -826,14 +830,32 @@ class SimplifiedBookService:
                     pass  # Error saving custom metadata
             
             print(f"🎉 [SIMPLIFIED] Book creation completed: {book_id}")
-            
+
             # Use safe checkpoint to ensure data is visible after container restarts
             # This is done AFTER all operations complete to avoid corruption
             # SafeKuzuManager handles persistence automatically
-            
+
             return book_id
-            
+
         except Exception as e:
+            # Best-effort cleanup: if we managed to create the Book node before
+            # something later failed (contributors, publisher, custom metadata),
+            # detach-delete it so the user doesn't end up with a half-written
+            # record that they can't fix.
+            import logging
+            logging.getLogger(__name__).exception(
+                "create_standalone_book failed; attempting cleanup"
+            )
+            try:
+                if 'book_id' in locals() and book_id:
+                    safe_execute_kuzu_query(
+                        "MATCH (b:Book {id: $book_id}) DETACH DELETE b",
+                        {"book_id": book_id},
+                    )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Cleanup of partial book also failed"
+                )
             return None
     
     def create_user_annotation(self, annotation: UserBookAnnotation) -> bool:

@@ -130,15 +130,16 @@ def select_highest_google_image(image_links: dict | None) -> str | None:
             return v
     return None
 
-def upgrade_google_cover_url(raw_url: str | None, *, allow_probe: bool = True) -> str | None:
+def upgrade_google_cover_url(raw_url: str | None, *, allow_probe: bool = False) -> str | None:
     """Normalize and opportunistically upgrade Google Books cover URL.
 
     Strategy:
     1. Ensure base params (printsec=frontcover, img=1).
     2. If no zoom, default zoom=1.
-    3. Probe a zoom=0 variant (largest) ONLY if original isn't already explicit extraLarge/large and we don't already have zoom=0.
-       - Use a 1s HEAD request; if Content-Length improves ( > original or above threshold ) adopt it.
-    Safe + fast: short timeout, swallow errors.
+    3. Optional probe (allow_probe=True) of a zoom=0 variant — disabled by
+       default because each library page render was firing tens of synchronous
+       HEAD calls (1s each), wedging worker threads under upstream slowness.
+       Background jobs that *want* the upgrade should pass allow_probe=True.
     """
     if not raw_url or 'books.google' not in raw_url:
         return raw_url
@@ -439,9 +440,13 @@ _IMPORT_VERBOSE = (
     or (os.getenv('IMPORT_VERBOSE') or 'false').lower() == 'true'
 )
 
+import builtins as _builtins_for_dprint
+
 def _dprint(*args, **kwargs):
+    # See note in book_search.py — `__builtins__` is a dict in imported
+    # modules; use the imported ``builtins`` module instead.
     if _IMPORT_VERBOSE:
-        __builtins__.print(*args, **kwargs)
+        _builtins_for_dprint.print(*args, **kwargs)
 
 print = _dprint
 
@@ -1361,16 +1366,14 @@ def _search_openlibrary_multiple(title, author=None, limit=10):
                 'score': score
             }
             
-            # Try to get cover image if we have an OpenLibrary work ID
+            # Use the OpenLibrary cover URL with `default=false` — if the cover
+            # is missing, the URL itself returns a 404 the browser can render
+            # as a placeholder. Sequential HEAD probes on every search result
+            # used to add up to 10s of latency per query.
             if result.get('openlibrary_id'):
-                cover_url = f"https://covers.openlibrary.org/w/id/{result['openlibrary_id']}-L.jpg"
-                try:
-                    cover_response = requests.head(cover_url, timeout=5)
-                    if cover_response.status_code == 200:
-                        result['cover'] = cover_url
-                        result['cover_url'] = cover_url
-                except:
-                    pass
+                cover_url = f"https://covers.openlibrary.org/w/id/{result['openlibrary_id']}-L.jpg?default=false"
+                result['cover'] = cover_url
+                result['cover_url'] = cover_url
             
             scored_matches.append(result)
         
@@ -1510,16 +1513,14 @@ def search_book_by_title_author(title, author=None):
                 'openlibrary_id': doc.get('key', '').replace('/works/', '') if doc.get('key') else None
             }
             
-            # Try to get cover image if we have an OpenLibrary work ID
+            # Use the OpenLibrary cover URL with `default=false` — if the cover
+            # is missing, the URL itself returns a 404 the browser can render
+            # as a placeholder. Sequential HEAD probes on every search result
+            # used to add up to 10s of latency per query.
             if result.get('openlibrary_id'):
-                cover_url = f"https://covers.openlibrary.org/w/id/{result['openlibrary_id']}-L.jpg"
-                try:
-                    cover_response = requests.head(cover_url, timeout=5)
-                    if cover_response.status_code == 200:
-                        result['cover'] = cover_url
-                        result['cover_url'] = cover_url
-                except:
-                    pass
+                cover_url = f"https://covers.openlibrary.org/w/id/{result['openlibrary_id']}-L.jpg?default=false"
+                result['cover'] = cover_url
+                result['cover_url'] = cover_url
             
             print(f"[OPENLIBRARY] Returning book data: {result}")
             return result

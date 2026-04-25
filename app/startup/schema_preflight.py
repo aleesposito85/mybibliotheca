@@ -27,7 +27,7 @@ import hashlib
 from pathlib import Path
 import time
 from typing import Dict, List, Tuple, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.utils.safe_kuzu_manager import get_safe_kuzu_manager
 from app.migrations.runner import run_pending as run_additive_migrations
@@ -71,7 +71,7 @@ def _load_marker() -> Dict[str, Any]:
 
 def _write_marker(meta: Dict[str, Any]):
     try:
-        payload = {"version": meta.get("version"), "sha256": meta.get("sha256"), "written_at": datetime.utcnow().isoformat()}
+        payload = {"version": meta.get("version"), "sha256": meta.get("sha256"), "written_at": datetime.now(timezone.utc).isoformat()}
         _marker_file().write_text(json.dumps(payload, indent=2))
     except Exception as e:
         logger.warning(f"Failed writing schema preflight marker: {e}")
@@ -398,7 +398,7 @@ def run_schema_preflight() -> None:
         except Exception as e:
             logger.error(f"❌ Schema preflight failed: {e}")
             raise
-    logger.info("Schema preflight finished at %s", datetime.utcnow().isoformat())
+    logger.info("Schema preflight finished at %s", datetime.now(timezone.utc).isoformat())
     _PREFLIGHT_RAN = True
     _PREFLIGHT_DB_KEY = current_db_key
     _write_marker(_SCHEMA_META)

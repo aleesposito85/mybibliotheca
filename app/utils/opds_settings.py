@@ -130,8 +130,21 @@ def save_opds_settings(update: Dict[str, Any]) -> bool:
             else:
                 payload[key] = value
 
-        with open(path, "w", encoding="utf-8") as f:
+        # Write atomically + chmod 0600 — this file holds the OPDS password
+        # in plaintext. World-readable mode would leak it via filesystem
+        # snapshots and shared mounts.
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         return True
     except Exception:
         return False
