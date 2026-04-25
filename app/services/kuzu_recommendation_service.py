@@ -452,6 +452,165 @@ def _signal_language_match(anchors: List[str], candidate_pool: Iterable[str]) ->
         return {}
 
 
+# ----- Anchors / exclusions / hydration ----------------------------------
+
+def _recent_finished_anchors(user_id: str, limit: int) -> List[str]:
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (u:User {id: $uid})-[m:HAS_PERSONAL_METADATA]->(b:Book) "
+            "WHERE m.finish_date IS NOT NULL "
+            "RETURN b.id AS book_id, m.finish_date AS finish_date "
+            "ORDER BY m.finish_date DESC LIMIT $limit",
+            {"uid": user_id, "limit": int(limit)},
+            user_id=user_id,
+            operation="recs_recent_finished",
+        )
+        return [r["book_id"] for r in _result_to_rows(result) if r.get("book_id")]
+    except Exception:
+        logger.exception("recs: recent_finished_anchors failed")
+        return []
+
+
+def _user_library_book_ids(user_id: str) -> set:
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (u:User {id: $uid})-[:HAS_PERSONAL_METADATA]->(b:Book) "
+            "RETURN b.id AS book_id",
+            {"uid": user_id},
+            user_id=user_id,
+            operation="recs_user_library_ids",
+        )
+        return {r["book_id"] for r in _result_to_rows(result) if r.get("book_id")}
+    except Exception:
+        logger.exception("recs: user_library_book_ids failed")
+        return set()
+
+
+def _hydrate_books(book_ids: List[str]) -> List[Dict[str, Any]]:
+    """Fetch display fields for an ordered list of book ids.
+
+    Returns dicts in the same order as ``book_ids`` (missing ids are
+    silently dropped). Includes title, isbn13/10, cover_url, language, and
+    authors derived from AUTHORED edges.
+    """
+    if not book_ids:
+        return []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (b:Book) WHERE b.id IN $ids "
+            "OPTIONAL MATCH (p:Person)-[:AUTHORED]->(b) "
+            "RETURN b.id AS id, b.title AS title, b.isbn13 AS isbn13, "
+            "       b.isbn10 AS isbn10, b.cover_url AS cover_url, "
+            "       b.language AS language, p.name AS author_name",
+            {"ids": list(book_ids)},
+            operation="recs_hydrate_books",
+        )
+        for row in _result_to_rows(result):
+            bid = row.get("id")
+            if not bid:
+                continue
+            entry = by_id.setdefault(bid, {
+                "id": bid,
+                "title": row.get("title") or "",
+                "isbn13": row.get("isbn13"),
+                "isbn10": row.get("isbn10"),
+                "cover_url": row.get("cover_url"),
+                "language": row.get("language"),
+                "authors": [],
+            })
+            author = row.get("author_name")
+            if author and author not in entry["authors"]:
+                entry["authors"].append(author)
+    except Exception:
+        logger.exception("recs: _hydrate_books failed")
+        return []
+    return [by_id[bid] for bid in book_ids if bid in by_id]
+
+
+def _popular_global(limit: int = 50) -> List[Dict[str, Any]]:
+    """Top books by distinct-user finish count (cached cross-user)."""
+    cached = cache_get(_key_popular())
+    if cached is not MISS:
+        return cached[:limit]
+    try:
+        result = safe_execute_kuzu_query(
+            "MATCH (b:Book)<-[m:HAS_PERSONAL_METADATA]-(u:User) "
+            "WHERE m.finish_date IS NOT NULL "
+            "WITH b.id AS book_id, count(DISTINCT u) AS n "
+            "ORDER BY n DESC LIMIT 50 "
+            "RETURN book_id",
+            None,
+            operation="recs_popular_global",
+        )
+        ids = [r["book_id"] for r in _result_to_rows(result) if r.get("book_id")]
+        books = _hydrate_books(ids)
+        for b in books:
+            b["recommendation_reason"] = "Popular among readers"
+        cache_set(_key_popular(), books, ttl_seconds=_TTL_POPULAR)
+        return books[:limit]
+    except Exception:
+        logger.exception("recs: popular_global failed")
+        return []
+
+
+def _continue_series_for(user_id: str, limit: int) -> List[Dict[str, Any]]:
+    """Return one card per started-but-incomplete series."""
+    try:
+        # Step A — started series and recent-finish timestamps.
+        result = safe_execute_kuzu_query(
+            "MATCH (u:User {id: $uid})-[m:HAS_PERSONAL_METADATA]->"
+            "(:Book)-[:PART_OF_SERIES]->(s:Series) "
+            "WHERE m.finish_date IS NOT NULL "
+            "RETURN s.id AS series_id, s.name AS series_name, "
+            "       max(m.finish_date) AS recent_finish",
+            {"uid": user_id},
+            user_id=user_id,
+            operation="recs_continue_series_a",
+        )
+        series_rows = _result_to_rows(result)
+        # Sort series by recency before fetching next-volumes.
+        series_rows.sort(key=lambda r: r.get("recent_finish") or 0, reverse=True)
+        out: List[Dict[str, Any]] = []
+        for row in series_rows:
+            sid = row.get("series_id")
+            sname = row.get("series_name") or "this series"
+            if not sid:
+                continue
+            # Step B — lowest unread volume for this series, for this user.
+            res2 = safe_execute_kuzu_query(
+                "MATCH (s:Series {id: $sid})<-[r:PART_OF_SERIES]-(next:Book) "
+                "WHERE NOT EXISTS { "
+                "  MATCH (:User {id: $uid})-[:HAS_PERSONAL_METADATA]->(next) "
+                "} "
+                "RETURN next.id AS book_id, r.volume_number AS volume_number "
+                "ORDER BY r.volume_number ASC LIMIT 1",
+                {"sid": sid, "uid": user_id},
+                user_id=user_id,
+                operation="recs_continue_series_b",
+            )
+            next_rows = _result_to_rows(res2)
+            if not next_rows:
+                continue
+            nxt = next_rows[0]
+            books = _hydrate_books([nxt["book_id"]])
+            if not books:
+                continue
+            book = books[0]
+            volume_number = nxt.get("volume_number")
+            book["recommendation_reason"] = (
+                f"Volume {volume_number} of {sname}" if volume_number is not None
+                else f"Next in {sname}"
+            )
+            out.append({"series_name": sname, "next_book": book})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        logger.exception("recs: continue_series_for failed")
+        return []
+
+
 # ----- Service skeleton ------------------------------------------------
 
 class KuzuRecommendationService:

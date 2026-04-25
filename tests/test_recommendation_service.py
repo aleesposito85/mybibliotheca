@@ -85,3 +85,64 @@ def test_language_match(kuzu_seeded):
         ids["book_foundation"]: True,
         ids["book_storm1"]: True,
     }
+
+
+from app.services.kuzu_recommendation_service import (
+    _recent_finished_anchors,
+    _user_library_book_ids,
+    _hydrate_books,
+    _popular_global,
+    _continue_series_for,
+)
+
+
+def test_recent_finished_anchors_orders_by_finish_date_desc(kuzu_seeded):
+    _, ids = kuzu_seeded
+    anchors = _recent_finished_anchors(ids["user_alice"], limit=5)
+    # alice's finishes: foundation(20), dune3(30), dune2(60), dune(90)
+    expected = [ids["book_foundation"], ids["book_dune3"], ids["book_dune2"], ids["book_dune"]]
+    assert anchors == expected
+
+
+def test_user_library_excludes_others(kuzu_seeded):
+    _, ids = kuzu_seeded
+    library = _user_library_book_ids(ids["user_alice"])
+    assert ids["book_dune"] in library
+    assert ids["book_foundation"] in library
+    # Bob's books not in alice's library
+    assert ids["book_storm1"] not in library
+
+
+def test_hydrate_books_returns_display_fields(kuzu_seeded):
+    _, ids = kuzu_seeded
+    books = _hydrate_books([ids["book_dune"], ids["book_foundation"]])
+    assert {b["title"] for b in books} == {"Dune", "Foundation"}
+    # Authors are populated from AUTHORED edges.
+    titles = {b["title"]: b for b in books}
+    assert titles["Dune"]["authors"] == ["Frank Herbert"]
+
+
+def test_hydrate_preserves_input_order(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _hydrate_books([ids["book_foundation"], ids["book_dune"]])
+    assert [b["title"] for b in out] == ["Foundation", "Dune"]
+
+
+def test_popular_global_orders_by_finish_count(kuzu_seeded):
+    _, ids = kuzu_seeded
+    pop = _popular_global(limit=5)
+    # Most finished in seed: dune (3 readers), foundation (3 readers).
+    titles = [b["title"] for b in pop]
+    assert "Dune" in titles[:2]
+    assert "Foundation" in titles[:2]
+
+
+def test_continue_series_for_alice(kuzu_seeded):
+    _, ids = kuzu_seeded
+    out = _continue_series_for(ids["user_alice"], limit=5)
+    # alice finished foundation vol 1 only; vol 2 is the next unread.
+    titles = {row["next_book"]["title"]: row for row in out}
+    assert "Foundation and Empire" in titles
+    # alice's most recent series finish is foundation (20 days ago) vs dune3 (30),
+    # so foundation continuation should come first.
+    assert out[0]["next_book"]["title"] == "Foundation and Empire"
