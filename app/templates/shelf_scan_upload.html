@@ -117,7 +117,11 @@
     submit.disabled = true;
     defaultLabel.classList.add('d-none');
     loadingLabel.classList.remove('d-none');
-    if (input) input.disabled = true;
+    // NOTE: do NOT disable the file input here — disabled inputs are
+    // excluded from form submission, which would drop the uploaded file
+    // and the route would 302-redirect with "Please choose an image."
+    // The label that triggers the picker is already hidden via parent
+    // display:none after a file is chosen, so re-triggering isn't a risk.
   });
 })();
 </script>
