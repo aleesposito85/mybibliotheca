@@ -355,24 +355,6 @@
   </div>
 </div>
 
-{# Recommended-for-you row, hidden when filtering or searching #}
-{% set _has_filter = (request.args.get('search') or request.args.get('status_filter') or request.args.get('category') or request.args.get('publisher') or request.args.get('language') or request.args.get('location') or request.args.get('media_type') or request.args.get('finished_after') or request.args.get('finished_before')) %}
-{% if not _has_filter %}
-<section id="library-recs-section" class="mb-3" hidden>
-  <h2 class="h5 mb-2">Recommended for you</h2>
-  <div id="library-recs-row" class="recommendation-row" aria-busy="true">
-    {% for _ in range(5) %}
-    <div class="recommendation-card" aria-hidden="true">
-      <div class="recommendation-card-cover" style="background:#eee;aspect-ratio:2/3;"></div>
-      <div class="recommendation-card-body">
-        <div class="recommendation-card-title">&nbsp;</div>
-      </div>
-    </div>
-    {% endfor %}
-  </div>
-</section>
-{% endif %}
-
 <!-- Advanced Filter Section -->
 <div class="filter-section">
   <h5 class="filter-title">Find Your Books</h5>
@@ -522,21 +504,6 @@
         <div class="empty-state-icon">📚</div>
         <h3>No books found</h3>
         <p>Try adjusting your filters or <a href="{{ url_for('main.add_book') }}">add some books</a> to your library!</p>
-
-        {# Popular fallback to seed a brand-new library #}
-        <section id="library-empty-recs-section" class="mt-4" hidden>
-          <h3 class="h6">Popular books to start your library</h3>
-          <div id="library-empty-recs-row" class="recommendation-row" aria-busy="true">
-            {% for _ in range(5) %}
-            <div class="recommendation-card" aria-hidden="true">
-              <div class="recommendation-card-cover" style="background:#eee;aspect-ratio:2/3;"></div>
-              <div class="recommendation-card-body">
-                <div class="recommendation-card-title">&nbsp;</div>
-              </div>
-            </div>
-            {% endfor %}
-          </div>
-        </section>
       </div>
     </div>
   {% endif %}
@@ -713,76 +680,6 @@ style.textContent = `
     }
 `;
 document.head.appendChild(style);
-</script>
-
-<script>
-(function(){
-  function renderInto(row, books, hideReason) {
-    row.innerHTML = '';
-    row.removeAttribute('aria-busy');
-    for (const book of books) {
-      const a = document.createElement('a');
-      a.className = 'recommendation-card';
-      a.href = '/book/' + encodeURIComponent(book.id);
-      const author = (book.authors && book.authors[0]) || '';
-      a.setAttribute('aria-label',
-        'Recommendation: ' + (book.title || '') +
-        (author ? ' by ' + author : '') +
-        (!hideReason && book.recommendation_reason ? '. ' + book.recommendation_reason : ''));
-      const cover = document.createElement('div');
-      cover.className = 'recommendation-card-cover';
-      const img = document.createElement('img');
-      img.alt = '';
-      img.loading = 'lazy';
-      img.src = book.cover_url || '/static/bookshelf.png';
-      img.onerror = function(){ img.src = '/static/bookshelf.png'; };
-      cover.appendChild(img);
-      const body = document.createElement('div');
-      body.className = 'recommendation-card-body';
-      const title = document.createElement('div');
-      title.className = 'recommendation-card-title';
-      title.textContent = book.title || '';
-      body.appendChild(title);
-      if (author) {
-        const au = document.createElement('div');
-        au.className = 'recommendation-card-author';
-        au.textContent = author;
-        body.appendChild(au);
-      }
-      if (!hideReason && book.recommendation_reason) {
-        const reason = document.createElement('div');
-        reason.className = 'recommendation-card-reason text-muted small';
-        reason.textContent = book.recommendation_reason;
-        body.appendChild(reason);
-      }
-      a.appendChild(cover);
-      a.appendChild(body);
-      row.appendChild(a);
-    }
-  }
-  function loadInto(sectionId, rowId, hideReason) {
-    const section = document.getElementById(sectionId);
-    const row = document.getElementById(rowId);
-    if (!section || !row) return;
-    fetch('/recommendations/api/library-row', {
-      credentials: 'same-origin',
-      headers: { 'Accept': 'application/json' }
-    })
-      .then(r => r.json())
-      .then(payload => {
-        const data = (payload && payload.data) || [];
-        if (!data.length) { section.remove(); return; }
-        renderInto(row, data, hideReason);
-        section.hidden = false;
-      })
-      .catch(err => {
-        console.warn('Library recommendations failed:', err);
-        section.remove();
-      });
-  }
-  loadInto('library-recs-section', 'library-recs-row', /*hideReason*/ true);
-  loadInto('library-empty-recs-section', 'library-empty-recs-row', /*hideReason*/ false);
-})();
 </script>
 
 </div>
