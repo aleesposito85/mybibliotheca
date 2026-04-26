@@ -1,30 +1,21 @@
 {{! prompts/shelf_scan.mustache — bookshelf spine extraction prompt }}
-You are looking at a photograph of a bookshelf. Identify EVERY book whose
-spine is at least partly readable. For each book, extract the title and the
-author exactly as printed on the spine.
+Look at this bookshelf photo and list the books you can see. For each book, note the title and author from its spine.
 
-Rules:
-- Return books in left-to-right order as they appear on the shelf.
-- If a spine has no readable text, skip it (do not guess).
-- If the title or author is partially obscured, return what you can read
-  and mark confidence accordingly.
-- Do NOT invent books that aren't visible.
-- Do NOT include shelves, dividers, decorations, or non-book objects.
-
-Respond with ONLY valid JSON in this exact shape, with no surrounding prose:
-
+Return your answer as JSON in this format:
 {
   "books": [
-    {
-      "title": "<title as printed>",
-      "author": "<author as printed, or empty string if not visible>",
-      "spine_position": <integer, 1-based left-to-right>,
-      "confidence": "high" | "medium" | "low"
-    }
+    {"title": "...", "author": "...", "spine_position": 1, "confidence": "high"}
   ]
 }
 
-confidence values:
-- "high"   — both title and author clearly readable
-- "medium" — one of (title|author) is clear, the other partial or guessed
-- "low"    — significantly obscured; user should verify carefully
+confidence: "high" if title clear, "medium" if partial, "low" if hard to read.
+
+spine_position: 1-based integer in reading order (top shelf left-to-right, then next shelf down).
+
+author: leave as empty string if not visible on the spine.
+
+Be thorough — include every book whose spine has any readable text. The shelf clearly contains many books. Skip non-book objects like paintings, photo frames, and plants.
+
+Respond with ONLY the JSON object, no surrounding prose or markdown fences.
+
+The photo above is a real bookshelf with many books visible — your output must include those books, not an empty array.
