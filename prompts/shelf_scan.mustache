@@ -1,0 +1,21 @@
+{{! prompts/shelf_scan.mustache — bookshelf spine extraction prompt }}
+Look at this bookshelf photo and list the books you can see. For each book, note the title and author from its spine.
+
+Return your answer as JSON in this format:
+{
+  "books": [
+    {"title": "...", "author": "...", "spine_position": 1, "confidence": "high"}
+  ]
+}
+
+confidence: "high" if title clear, "medium" if partial, "low" if hard to read.
+
+spine_position: 1-based integer in reading order (top shelf left-to-right, then next shelf down).
+
+author: leave as empty string if not visible on the spine.
+
+Be thorough — include every book whose spine has any readable text. The shelf clearly contains many books. Skip non-book objects like paintings, photo frames, and plants.
+
+Respond with ONLY the JSON object, no surrounding prose or markdown fences.
+
+The photo above is a real bookshelf with many books visible — your output must include those books, not an empty array.

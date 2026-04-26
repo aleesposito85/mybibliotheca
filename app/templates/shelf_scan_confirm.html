@@ -1,0 +1,228 @@
+{% extends "base.html" %}
+
+{% block title %}Confirm Scan Results - MyBibliotheca{% endblock %}
+
+{% block content %}
+<style>
+  .scan-summary { display: grid; gap: .5rem 1rem; grid-template-columns: max-content 1fr; align-items: baseline; }
+  .scan-summary dt { font-weight: 600; }
+  .scan-summary dd { margin: 0; }
+  .scan-card { transition: transform 100ms ease, box-shadow 100ms ease; }
+  .scan-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,.06); }
+  .scan-card .cover-wrap { aspect-ratio: 2/3; overflow: hidden; background: #eee; border-radius: 6px 6px 0 0; }
+  .scan-card .cover-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .scan-card.disabled { opacity: .55; }
+  .scan-card .conf-badge { font-size: .7rem; }
+  .conf-high { background: #198754; color: #fff; }
+  .conf-medium { background: #ffc107; color: #000; }
+  .conf-low { background: #dc3545; color: #fff; }
+</style>
+
+<div class="container">
+  <h1 class="mb-3">Scan results</h1>
+
+  <div class="row mb-3 g-3">
+    <div class="col-md-4">
+      {% if preview_url %}
+      <a href="{{ preview_url }}" target="_blank" rel="noopener">
+        <img src="{{ preview_url }}" alt="Bookshelf preview"
+             class="img-fluid rounded border">
+      </a>
+      {% endif %}
+    </div>
+    <div class="col-md-8">
+      <dl class="scan-summary">
+        <dt>Detected</dt><dd>{{ summary.detected }}</dd>
+        <dt>Matched in our database</dt><dd>{{ summary.matched }}</dd>
+        <dt>Already in your library</dt><dd>{{ summary.already_owned }}</dd>
+        <dt>Unmatched</dt><dd>{{ summary.unmatched }}</dd>
+      </dl>
+    </div>
+  </div>
+
+  {% if candidates %}
+  <div class="d-flex gap-2 flex-wrap mb-3">
+    <button type="button" class="btn btn-outline-secondary btn-sm" id="select-all-btn">Select all</button>
+    <button type="button" class="btn btn-outline-secondary btn-sm" id="select-none-btn">Select none</button>
+    <button type="button" class="btn btn-outline-secondary btn-sm" id="select-high-btn">Only high confidence</button>
+  </div>
+
+  <form id="confirm-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="scan_id" value="{{ scan_id }}">
+    <input type="hidden" name="overrides" id="overrides-input" value="{}">
+
+    <div class="row g-3" id="card-grid">
+      {% for c in candidates %}
+        {% set bm = c.best_match %}
+        {% set is_matched = c.matched %}
+        {% set conf = c.confidence %}
+        <div class="col-12 col-sm-6 col-lg-3 scan-card-col" data-detection-id="{{ c.detection_id }}">
+          <div class="card scan-card h-100 {% if not is_matched %}disabled{% endif %}">
+            <div class="cover-wrap">
+              {% if is_matched and bm and bm.cover_url %}
+                <img src="{{ bm.cover_url }}" alt="" class="cover-img"
+                     onerror="this.src='/static/bookshelf.png'">
+              {% else %}
+                <img src="/static/bookshelf.png" alt="">
+              {% endif %}
+            </div>
+            <div class="card-body p-2">
+              <div class="d-flex justify-content-between mb-1">
+                <small class="text-muted">#{{ c.spine_position }}</small>
+                <span class="badge conf-{{ conf }} conf-badge">{{ conf }}</span>
+              </div>
+              {% if is_matched and bm %}
+                <div class="fw-semibold small card-title-text">{{ bm.title }}</div>
+                <div class="text-muted small card-author-text">{{ bm.authors|join(', ') if bm.authors else '' }}</div>
+              {% else %}
+                <div class="fw-semibold small">{{ c.detected.title }}</div>
+                <div class="text-muted small">{{ c.detected.author }}</div>
+                <div class="alert alert-warning p-1 mt-2 small mb-0">
+                  Couldn't find in metadata.
+                  <a target="_blank" rel="noopener"
+                     href="{{ url_for('main.add_book') }}?title={{ c.detected.title|urlencode }}">Search manually</a>
+                </div>
+              {% endif %}
+
+              <div class="form-check mt-2">
+                <input class="form-check-input scan-pick" type="checkbox" name="detection_id"
+                       value="{{ c.detection_id }}"
+                       id="pick-{{ c.detection_id }}"
+                       data-confidence="{{ conf }}"
+                       {% if c.default_selected %}checked{% endif %}
+                       {% if not is_matched %}disabled{% endif %}>
+                <label class="form-check-label small" for="pick-{{ c.detection_id }}">Add to library</label>
+              </div>
+
+              {% if is_matched and c.alternatives %}
+              <details class="mt-2 small">
+                <summary>Other editions ({{ c.alternatives|length }})</summary>
+                <select class="form-select form-select-sm mt-1 alt-select"
+                        data-detection-id="{{ c.detection_id }}">
+                  <option value="-1" selected>{{ bm.title }} (top match)</option>
+                  {% for alt in c.alternatives %}
+                  <option value="{{ loop.index0 }}">{{ alt.title }} — {{ alt.authors|join(', ') }}</option>
+                  {% endfor %}
+                </select>
+              </details>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="d-flex justify-content-between align-items-center my-4">
+      <button type="button" class="btn btn-outline-danger" id="discard-btn">Discard scan</button>
+      <button type="submit" class="btn btn-primary" id="submit-btn">
+        Add <span id="submit-count">0</span> selected books →
+      </button>
+    </div>
+  </form>
+  {% else %}
+  <div class="alert alert-info">
+    No candidates to confirm. Try a different photo.
+    <a href="{{ url_for('shelf_scan.upload_page') }}" class="alert-link">Scan another shelf</a>.
+  </div>
+  {% endif %}
+</div>
+
+<script>
+(function(){
+  const grid = document.getElementById('card-grid');
+  if (!grid) return;
+  const submitBtn = document.getElementById('submit-btn');
+  const countEl = document.getElementById('submit-count');
+  const overridesInput = document.getElementById('overrides-input');
+  const form = document.getElementById('confirm-form');
+  const scanId = form.querySelector('[name="scan_id"]').value;
+
+  const overrides = {};
+
+  function refreshSubmitState() {
+    const checked = grid.querySelectorAll('.scan-pick:checked:not(:disabled)').length;
+    countEl.textContent = checked;
+    submitBtn.disabled = checked === 0;
+  }
+
+  grid.addEventListener('change', function(e){
+    if (e.target.classList.contains('scan-pick')) refreshSubmitState();
+    if (e.target.classList.contains('alt-select')) {
+      const detId = e.target.dataset.detectionId;
+      const idx = parseInt(e.target.value, 10);
+      if (Number.isInteger(idx) && idx >= 0) {
+        overrides[detId] = idx;
+      } else {
+        delete overrides[detId];
+      }
+      overridesInput.value = JSON.stringify(overrides);
+      // Update displayed title/author of the card to match the selected alt.
+      const opt = e.target.selectedOptions[0];
+      const card = e.target.closest('.scan-card');
+      const title = card.querySelector('.card-title-text');
+      if (title && opt && opt.textContent) {
+        const split = opt.textContent.split(' — ');
+        title.textContent = split[0];
+        const author = card.querySelector('.card-author-text');
+        if (author) author.textContent = split.slice(1).join(' — ');
+      }
+    }
+  });
+
+  document.getElementById('select-all-btn').addEventListener('click', function(){
+    grid.querySelectorAll('.scan-pick:not(:disabled)').forEach(cb => cb.checked = true);
+    refreshSubmitState();
+  });
+  document.getElementById('select-none-btn').addEventListener('click', function(){
+    grid.querySelectorAll('.scan-pick').forEach(cb => cb.checked = false);
+    refreshSubmitState();
+  });
+  document.getElementById('select-high-btn').addEventListener('click', function(){
+    grid.querySelectorAll('.scan-pick:not(:disabled)').forEach(cb => {
+      cb.checked = (cb.dataset.confidence === 'high');
+    });
+    refreshSubmitState();
+  });
+
+  document.getElementById('discard-btn').addEventListener('click', function(){
+    if (!confirm('Discard this scan? Anything you haven\'t added will be lost.')) return;
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
+              || document.querySelector('input[name="csrf_token"]')?.value;
+    fetch('/books/scan/' + encodeURIComponent(scanId) + '/discard', {
+      method: 'POST', credentials: 'same-origin',
+      headers: csrf ? { 'X-CSRFToken': csrf } : {}
+    }).then(() => { window.location = '/books/scan/'; });
+  });
+
+  form.addEventListener('submit', function(e){
+    e.preventDefault();
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Starting…';
+    const fd = new FormData(form);
+    fetch('/books/scan/confirm', {
+      method: 'POST', body: fd, credentials: 'same-origin',
+      headers: { 'Accept': 'application/json' },
+    })
+      .then(r => r.json())
+      .then(payload => {
+        if (payload.status === 'success') {
+          window.location = '/import/progress/' + encodeURIComponent(payload.task_id);
+        } else {
+          alert(payload.message || 'Something went wrong');
+          submitBtn.disabled = false;
+          refreshSubmitState();
+        }
+      })
+      .catch(err => {
+        console.warn(err);
+        alert('Network error. Please try again.');
+        submitBtn.disabled = false;
+        refreshSubmitState();
+      });
+  });
+
+  refreshSubmitState();
+})();
+</script>
+{% endblock %}

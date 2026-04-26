@@ -88,6 +88,179 @@ class AIService:
             current_app.logger.error(f"Error in AI book extraction: {e}")
             return None
     
+    def is_configured(self) -> bool:
+        """True when at least one AI provider has the credentials we need.
+
+        Used by the shelf-scan upload page to decide whether to disable
+        the submit button. Mirrors the provider-selection logic in
+        extract_book_info_from_image.
+        """
+        primary = (self.provider or "openai").lower()
+        if primary == "openai":
+            if self.config.get("OPENAI_API_KEY"):
+                return True
+        if primary == "ollama":
+            if self.config.get("OLLAMA_BASE_URL"):
+                return True
+        # Fallback considered configured when the OTHER provider is set.
+        if self.config.get("AI_FALLBACK_ENABLED", "true").lower() == "true":
+            if self.config.get("OPENAI_API_KEY") or self.config.get("OLLAMA_BASE_URL"):
+                return True
+        return False
+
+    def extract_books_from_shelf_image(self, image_data: bytes) -> list:
+        """Extract a list of {title, author, spine_position, confidence}
+        from a bookshelf photo.
+
+        Uses the same provider-selection + fallback dance as
+        extract_book_info_from_image but with a different prompt and a
+        multi-book parser. Returns [] if nothing usable came back.
+        """
+        # Local import keeps the module's top-level imports light and
+        # avoids a circular import if shelf_scan_service ever imports
+        # ai_service eagerly.
+        from .shelf_scan_service import _parse_shelf_response
+
+        prompt = self._load_shelf_scan_prompt()
+
+        primary = (self.provider or "openai").lower()
+        secondary = "ollama" if primary == "openai" else "openai"
+        providers_to_try = [primary]
+
+        fallback_enabled = self.config.get("AI_FALLBACK_ENABLED", "true").lower() == "true"
+        other_configured = (
+            (secondary == "openai" and bool(self.config.get("OPENAI_API_KEY")))
+            or (secondary == "ollama" and bool(self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")))
+        )
+        if fallback_enabled and other_configured:
+            providers_to_try.append(secondary)
+
+        last_error = None
+        for prov in providers_to_try:
+            try:
+                try:
+                    current_app.logger.error(f"[shelf_scan] trying provider={prov} model={self.config.get('OPENAI_MODEL') if prov=='openai' else self.config.get('OLLAMA_MODEL')}")
+                except Exception:
+                    pass
+                if prov == "openai":
+                    raw = self._call_openai_vision(image_data, prompt)
+                elif prov == "ollama":
+                    raw = self._call_ollama_vision(image_data, prompt)
+                else:
+                    continue
+                if raw is None:
+                    try:
+                        current_app.logger.error(f"[shelf_scan] provider={prov} returned no content (probably non-200 HTTP)")
+                    except Exception:
+                        pass
+                    continue
+                parsed = _parse_shelf_response(raw)
+                if parsed:
+                    try:
+                        current_app.logger.error(f"[shelf_scan] provider={prov} succeeded with {len(parsed)} books")
+                    except Exception:
+                        pass
+                    return parsed
+                # Empty parse — try the next provider before giving up.
+                try:
+                    current_app.logger.error(f"[shelf_scan] provider={prov} returned unparseable content: {raw[:300]!r}")
+                except Exception:
+                    pass
+            except Exception as e:
+                last_error = e
+                try:
+                    current_app.logger.error(f"[shelf_scan] provider={prov} raised: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+
+        if last_error:
+            try:
+                current_app.logger.error(
+                    f"Shelf scan failed after trying providers {providers_to_try}: {last_error}"
+                )
+            except Exception:
+                pass
+        return []
+
+    def _load_shelf_scan_prompt(self) -> str:
+        _inline_fallback = (
+            "You are looking at a photograph of a bookshelf. Identify EVERY book "
+            "whose spine is at least partly readable. Return ONLY valid JSON: "
+            '{"books":[{"title":"...","author":"...","spine_position":1,"confidence":"high"}]}.'
+        )
+        try:
+            root_parent = os.path.dirname(current_app.root_path)
+        except RuntimeError:
+            # No Flask application context (e.g. during unit tests).
+            return _inline_fallback
+        path = os.path.join(root_parent, "prompts", "shelf_scan.mustache")
+        if not os.path.exists(path):
+            # Inline fallback so missing-file deployments still work; matches
+            # the prompt content in the spec.
+            return _inline_fallback
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def _call_openai_vision(self, image_data: bytes, prompt: str):
+        api_key = self.config.get("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        base_url = self.config.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        model = self.config.get("OPENAI_MODEL", "gpt-4o-mini")
+        b64 = base64.b64encode(image_data).decode("ascii")
+        body = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ],
+            }],
+            "max_tokens": self.max_tokens,
+            "temperature": float(self.config.get("AI_TEMPERATURE", "0.1")),
+            # response_format guarantees JSON for shelf-scan parsing.
+            "response_format": {"type": "json_object"},
+        }
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=self.timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()["choices"][0]["message"]["content"]
+
+    def _call_ollama_vision(self, image_data: bytes, prompt: str):
+        base_url = self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        model = self.config.get("OLLAMA_MODEL", "llama3.2-vision")
+        b64 = base64.b64encode(image_data).decode("ascii")
+        # Cap the context window. Vision models like qwen2.5vl default to
+        # 128k context, which makes Ollama allocate a 30+ GiB KV cache and
+        # fail to load on most consumer hardware. The shelf-scan prompt +
+        # image + response fit comfortably in 4k tokens, so we set num_ctx
+        # explicitly. Override via OLLAMA_NUM_CTX env / admin config.
+        num_ctx = int(self.config.get("OLLAMA_NUM_CTX", "4096"))
+        body = {
+            "model": model,
+            "stream": False,
+            "messages": [{
+                "role": "user",
+                "content": prompt + "\n\nReturn ONLY the JSON object, no markdown, no commentary.",
+                "images": [b64],
+            }],
+            "options": {
+                "temperature": float(self.config.get("AI_TEMPERATURE", "0.1")),
+                "num_predict": self.max_tokens,
+                "num_ctx": num_ctx,
+            },
+        }
+        resp = requests.post(f"{base_url}/api/chat", json=body, timeout=self.timeout)
+        if resp.status_code != 200:
+            return None
+        return resp.json()["message"]["content"]
+
     def _load_prompt_template(self) -> str:
         """Load the mustache prompt template"""
         try:

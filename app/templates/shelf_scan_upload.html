@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+
+{% block title %}Scan Bookshelf - MyBibliotheca{% endblock %}
+
+{% block content %}
+<style>
+  .scan-upload-zone {
+    border: 2px dashed var(--border-soft, rgba(0,0,0,.15));
+    border-radius: 10px;
+    padding: 2rem;
+    text-align: center;
+    background: var(--surface-secondary, #fafafa);
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+  }
+  .scan-upload-zone.dragover {
+    border-color: var(--bs-primary);
+    background: rgba(13, 110, 253, .05);
+  }
+  .scan-preview-thumb {
+    max-width: 320px; max-height: 240px;
+    border-radius: 8px; margin: 1rem auto; display: block;
+    border: 1px solid var(--border-soft, rgba(0,0,0,.1));
+  }
+</style>
+
+<div class="container">
+  <h1 class="mb-3">Scan a bookshelf</h1>
+  <p class="text-muted">Take or upload a clear, well-lit photo of your bookshelf — we'll identify multiple books at once.</p>
+
+  {% if error %}
+  <div class="alert alert-warning d-flex justify-content-between align-items-start" role="alert">
+    <div>{{ error }}</div>
+  </div>
+  {% endif %}
+
+  <div class="card mb-3">
+    <div class="card-body">
+      <form method="POST" action="{{ url_for('shelf_scan.upload') }}" enctype="multipart/form-data" id="shelf-scan-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="scan-upload-zone" id="upload-zone">
+          <div id="upload-zone-content">
+            <i class="bi bi-camera fs-1"></i>
+            <p class="mb-1">Drop a JPEG/PNG/WebP here, or</p>
+            <label class="btn btn-outline-primary mb-0">
+              Choose a file
+              <input type="file" name="shelf_image" accept="image/jpeg,image/png,image/webp"
+                     class="visually-hidden" id="shelf-image-input">
+            </label>
+          </div>
+          <img id="shelf-image-preview" class="scan-preview-thumb"
+               {% if preview_url %}src="{{ preview_url }}"{% endif %}
+               style="{% if not preview_url %}display:none;{% endif %}">
+        </div>
+
+        <div class="alert alert-info mt-3 mb-3 small d-flex align-items-center" role="status">
+          <i class="bi bi-info-circle me-2"></i>
+          <div>{{ ai.label }}</div>
+        </div>
+
+        <button type="submit" class="btn btn-primary w-100" id="shelf-scan-submit"
+                {% if not ai.configured %}disabled{% endif %}>
+          <span class="default-label">Scan shelf</span>
+          <span class="loading-label d-none">
+            <span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+            Scanning… 30–80 seconds
+          </span>
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const zone = document.getElementById('upload-zone');
+  const input = document.getElementById('shelf-image-input');
+  const preview = document.getElementById('shelf-image-preview');
+  const form = document.getElementById('shelf-scan-form');
+  const submit = document.getElementById('shelf-scan-submit');
+  const defaultLabel = submit.querySelector('.default-label');
+  const loadingLabel = submit.querySelector('.loading-label');
+  const zoneContent = document.getElementById('upload-zone-content');
+
+  function showPreview(file) {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    preview.src = url;
+    preview.style.display = '';
+    zoneContent.style.display = 'none';
+  }
+
+  if (zone && input) {
+    zone.addEventListener('click', function(e){
+      // Don't double-fire when clicking the inner label.
+      if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'LABEL') input.click();
+    });
+    ['dragenter','dragover'].forEach(evt => zone.addEventListener(evt, e => {
+      e.preventDefault(); e.stopPropagation(); zone.classList.add('dragover');
+    }));
+    ['dragleave','drop'].forEach(evt => zone.addEventListener(evt, e => {
+      e.preventDefault(); e.stopPropagation(); zone.classList.remove('dragover');
+    }));
+    zone.addEventListener('drop', e => {
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        showPreview(file);
+      }
+    });
+    input.addEventListener('change', () => showPreview(input.files[0]));
+  }
+
+  form.addEventListener('submit', () => {
+    submit.disabled = true;
+    defaultLabel.classList.add('d-none');
+    loadingLabel.classList.remove('d-none');
+    // NOTE: do NOT disable the file input here — disabled inputs are
+    // excluded from form submission, which would drop the uploaded file
+    // and the route would 302-redirect with "Please choose an image."
+    // The label that triggers the picker is already hidden via parent
+    // display:none after a file is chosen, so re-triggering isn't a risk.
+  });
+})();
+</script>
+{% endblock %}

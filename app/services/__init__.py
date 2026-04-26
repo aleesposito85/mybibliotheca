@@ -36,6 +36,7 @@ try:
     _reading_log_service = None
     _opds_probe_service = None
     _opds_sync_service = None
+    _shelf_scan_service = None
     
     # Module-level flag to ensure migration executes only once lazily
     _OWNS_MIGRATION_RAN = False
@@ -121,7 +122,15 @@ try:
             probe = _get_opds_probe_service()
             _opds_sync_service = OPDSSyncService(probe_service=probe)
         return _opds_sync_service
-    
+
+    def _get_shelf_scan_service():
+        global _shelf_scan_service
+        if _shelf_scan_service is None:
+            _run_migration_once()
+            from .shelf_scan_service import ShelfScanService
+            _shelf_scan_service = ShelfScanService()
+        return _shelf_scan_service
+
     # Create property-like access using classes
     class _LazyService:
         """Lazy service that initializes on first access."""
@@ -149,17 +158,18 @@ try:
     recommendation_service = _LazyService(_get_recommendation_service)
     opds_probe_service = _LazyService(_get_opds_probe_service)
     opds_sync_service = _LazyService(_get_opds_sync_service)
+    shelf_scan_service = _LazyService(_get_shelf_scan_service)
 
     def reset_all_services():
         """Reset all service instances to force fresh initialization."""
         global _book_service, _user_service, _custom_field_service
         global _import_mapping_service, _person_service, _reading_log_service
         global _opds_probe_service, _opds_sync_service
-        global _recommendation_service
+        global _recommendation_service, _shelf_scan_service
         global book_service, user_service, custom_field_service
         global import_mapping_service, person_service, reading_log_service
         global opds_probe_service, opds_sync_service
-        global recommendation_service
+        global recommendation_service, shelf_scan_service
 
         # Clear global service instances
         _book_service = None
@@ -171,6 +181,7 @@ try:
         _opds_probe_service = None
         _opds_sync_service = None
         _recommendation_service = None
+        _shelf_scan_service = None
 
         # Clear lazy service wrapper instances
         book_service._service = None
@@ -185,6 +196,8 @@ try:
             opds_probe_service._service = None  # type: ignore[attr-defined]
         if hasattr(opds_sync_service, "_service"):
             opds_sync_service._service = None  # type: ignore[attr-defined]
+        if hasattr(shelf_scan_service, "_service"):
+            shelf_scan_service._service = None  # type: ignore[attr-defined]
 
         # Recreate lazy service wrappers completely
         book_service = _LazyService(_get_book_service)
@@ -196,6 +209,7 @@ try:
         recommendation_service = _LazyService(_get_recommendation_service)
         opds_probe_service = _LazyService(_get_opds_probe_service)
         opds_sync_service = _LazyService(_get_opds_sync_service)
+        shelf_scan_service = _LazyService(_get_shelf_scan_service)
 
         return True
 
@@ -234,7 +248,8 @@ try:
         'opds_probe_service',
         'opds_sync_service',
         'ensure_opds_sync_runner',
-        'get_opds_sync_runner'
+        'get_opds_sync_runner',
+        'shelf_scan_service',
     ]
 except ImportError as e:
     # Fallback imports

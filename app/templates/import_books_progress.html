@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Import Progress - MyBibliotheca{% endblock %}
 {% block content %}
+{# Source banner — set when the job came from the bookshelf scanner #}
+{% if job and job.source == 'shelf_scan' %}
+<div class="alert alert-info d-flex align-items-center" role="status">
+  <i class="bi bi-camera me-2"></i>
+  <div>Importing {{ job.total or 0 }} books from a shelf scan.</div>
+</div>
+{% endif %}
 <style>
 /* Dark mode enhancements for Import Books Progress */
 [data-theme="dark"] .text-muted {
