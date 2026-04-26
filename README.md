@@ -1,8 +1,11 @@
 > **Fork notice.** This is a maintained fork of the original
 > [`pickles4evaaaa/mybibliotheca`](https://github.com/pickles4evaaaa/mybibliotheca),
 > which the upstream author flagged as no longer maintained. This fork adds
-> security/data-integrity fixes from a full code audit and a new graph-based
-> recommendations feature ("Discover" page). See
+> security/data-integrity fixes from a full code audit, a graph-based
+> recommendations feature ("Discover" page), and a bookshelf scanner that
+> reads spines from a single photo via a multimodal vision LLM. Pre-built
+> Docker images are published to GHCR — see
+> [Docker quick start](#-docker-quick-start-pre-built-image) and
 > [What's new in this fork](#-whats-new-in-this-fork) below.
 
 # 📚 MyBibliotheca
@@ -53,8 +56,26 @@ View comprehensive book information including genres, authors, reading status, p
 - 👤 **Admin Management**: Administrative tools and user management
 - 🔗 **Graph Database**: Powered by KuzuDB for advanced relationship modeling and queries
 - 🧭 **Discover (recommendations)** *(new in this fork)*: graph-based "you might also enjoy" suggestions on the book detail page, library row, and a dedicated `/recommendations` page. Combines content signals (shared authors, categories, series) with an aggregate co-reader signal floored at ≥3 distinct readers for privacy.
+- 📷 **Scan Shelf** *(new in this fork)*: snap a photo of a bookshelf and a multimodal vision LLM (local Ollama or any OpenAI-compatible cloud endpoint) extracts every readable spine, fuzzy-matches each title against the unified metadata pipeline, and lets you pick which detections to bulk-import.
 
-#### 🚀 Docker Quick Start: [View Documentation](https://mybibliotheca.org/)
+## 🚀 Docker quick start (pre-built image)
+
+Pre-built multi-arch (amd64 + arm64) images are published to GitHub Container Registry on every push to `main`. To run without cloning:
+
+```bash
+mkdir mybibliotheca && cd mybibliotheca
+mkdir data
+cat > .env <<'EOF'
+SECRET_KEY=$(openssl rand -hex 32)
+SECURITY_PASSWORD_SALT=$(openssl rand -hex 16)
+EOF
+curl -fsSL https://raw.githubusercontent.com/aleesposito85/mybibliotheca/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d
+```
+
+Then visit `http://localhost:5054`. Image: [`ghcr.io/aleesposito85/mybibliotheca:latest`](https://github.com/aleesposito85/mybibliotheca/pkgs/container/mybibliotheca).
+
+For upstream's documentation site see [mybibliotheca.org](https://mybibliotheca.org/).
 
 
 ## 🗂️ Project Structure
@@ -187,6 +208,69 @@ Related files:
 - Templates: [`app/templates/recommendations.html`](app/templates/recommendations.html), [`app/templates/_recommendation_card.html`](app/templates/_recommendation_card.html)
 - Design spec: [`docs/superpowers/specs/2026-04-25-recommendations-design.md`](docs/superpowers/specs/2026-04-25-recommendations-design.md)
 - Implementation plan: [`docs/superpowers/plans/2026-04-25-recommendations.md`](docs/superpowers/plans/2026-04-25-recommendations.md)
+
+### 3. Bookshelf scanner
+
+A "Scan Shelf" card on the Add Book page accepts a photo of a bookshelf,
+sends it to a multimodal vision LLM, and turns each readable spine into an
+import candidate. The whole flow is privacy-first: by default it talks to
+a local Ollama instance, with an OpenAI-compatible cloud endpoint as an
+optional fallback.
+
+How it works:
+
+- **Image preprocessing** — Pillow validates the upload, applies EXIF
+  orientation, downscales to a max edge, and re-encodes to JPEG. The
+  decompression-bomb cap is lifted to 250M pixels locally so that modern
+  phone cameras work, while still rejecting truly malicious payloads.
+- **Vision extraction** — `AIService.extract_books_from_shelf_image()`
+  reuses the same provider-selection + fallback logic as single-cover
+  extraction. The prompt at
+  [`prompts/shelf_scan.mustache`](prompts/shelf_scan.mustache) was tuned
+  to keep cloud models from bailing with `{"books": []}` (positive
+  framing, inline JSON example, explicit anti-empty assertion). Local
+  Ollama defaults to `qwen3-vl:8b`; cloud has been validated against
+  `qwen3-vl:235b-instruct` on Ollama Cloud.
+- **Parser** — pure-Python parser handles the dozen JSON variants real
+  models emit (markdown fences, prose preambles, single-book objects,
+  comments, trailing commas) and normalises into a canonical
+  `{title, author, spine_position, confidence}` shape.
+- **Per-detection enrichment** — each detection runs through
+  `unified_metadata.fetch_unified_by_title()` (Google Books +
+  OpenLibrary) in a small parallel pool, with confidence scoring
+  comparing the LLM's title against each candidate.
+- **Confirmation UI** — a pre-enriched grid shows cover / metadata /
+  confidence for every detection; the user picks which ones to import.
+  Nothing is written to the DB until confirmation.
+- **Bulk-add** — the confirmed selections feed `safe_import_manager`,
+  reusing the existing CSV-import async progress page (with a banner
+  marking the source as `shelf_scan`).
+- **Configuration** — provider, base URL, API key, model, and timeouts
+  all flow through the existing admin AI settings page (no separate
+  config). A dedicated `SHELF_SCAN_AI_TIMEOUT` (default 180s) overrides
+  the shorter timeout used for single-cover extraction.
+
+Endpoints (all under `/books/scan/`):
+
+- `GET /upload` — upload form
+- `POST /upload` — preprocess + run extraction synchronously
+- `GET /confirm/<scan_id>` — pre-enriched candidate grid
+- `POST /confirm/<scan_id>` — kick off async bulk-add
+- `POST /discard/<scan_id>` — drop the scan store entry
+
+Tests: 47 across `tests/test_shelf_scan_service.py`,
+`tests/test_shelf_scan_parser.py`, `tests/test_shelf_scan_aiservice.py`,
+and `tests/test_shelf_scan_routes.py`.
+
+Related files:
+
+- Service: [`app/services/shelf_scan_service.py`](app/services/shelf_scan_service.py)
+- AI extension: [`app/services/ai_service.py`](app/services/ai_service.py)
+- Routes: [`app/routes/shelf_scan_routes.py`](app/routes/shelf_scan_routes.py)
+- Templates: [`app/templates/shelf_scan_upload.html`](app/templates/shelf_scan_upload.html), [`app/templates/shelf_scan_confirm.html`](app/templates/shelf_scan_confirm.html)
+- Prompt: [`prompts/shelf_scan.mustache`](prompts/shelf_scan.mustache)
+- Design spec: [`docs/superpowers/specs/2026-04-26-bookshelf-scanner-design.md`](docs/superpowers/specs/2026-04-26-bookshelf-scanner-design.md)
+- Implementation plan: [`docs/superpowers/plans/2026-04-26-bookshelf-scanner.md`](docs/superpowers/plans/2026-04-26-bookshelf-scanner.md)
 
 ---
 
