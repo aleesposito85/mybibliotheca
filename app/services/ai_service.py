@@ -138,6 +138,10 @@ class AIService:
         last_error = None
         for prov in providers_to_try:
             try:
+                try:
+                    current_app.logger.error(f"[shelf_scan] trying provider={prov} model={self.config.get('OPENAI_MODEL') if prov=='openai' else self.config.get('OLLAMA_MODEL')}")
+                except Exception:
+                    pass
                 if prov == "openai":
                     raw = self._call_openai_vision(image_data, prompt)
                 elif prov == "ollama":
@@ -145,15 +149,27 @@ class AIService:
                 else:
                     continue
                 if raw is None:
+                    try:
+                        current_app.logger.error(f"[shelf_scan] provider={prov} returned no content (probably non-200 HTTP)")
+                    except Exception:
+                        pass
                     continue
                 parsed = _parse_shelf_response(raw)
                 if parsed:
+                    try:
+                        current_app.logger.error(f"[shelf_scan] provider={prov} succeeded with {len(parsed)} books")
+                    except Exception:
+                        pass
                     return parsed
                 # Empty parse — try the next provider before giving up.
+                try:
+                    current_app.logger.error(f"[shelf_scan] provider={prov} returned unparseable content: {raw[:300]!r}")
+                except Exception:
+                    pass
             except Exception as e:
                 last_error = e
                 try:
-                    current_app.logger.warning(f"Shelf-scan provider {prov} failed: {e}")
+                    current_app.logger.error(f"[shelf_scan] provider={prov} raised: {type(e).__name__}: {e}")
                 except Exception:
                     pass
 

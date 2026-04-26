@@ -126,7 +126,7 @@ import threading
 import time
 from typing import Any, Dict, Tuple
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 # Long-edge cap for resize. 2048 keeps spine recognition accurate while
@@ -269,6 +269,16 @@ class ShelfScanService:
 
             if img.format not in _ALLOWED_FORMATS:
                 raise ValueError(f"Unsupported image format: {img.format!r}")
+
+            # Honour EXIF orientation. Phone photos store the sensor's raw
+            # pixel data plus an "Orientation" tag; if we don't apply it
+            # before re-encoding to JPEG, the LLM sees the image rotated
+            # (often 90° for portrait shots) and fails to recognize sideways
+            # spine text.
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                logger.exception("shelf_scan: exif_transpose failed; using original orientation")
 
             # Resize so the longer edge is <= MAX_LONG_EDGE.
             if max(img.size) > MAX_LONG_EDGE:
