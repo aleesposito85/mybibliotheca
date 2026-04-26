@@ -220,6 +220,12 @@ class AIService:
         base_url = self.config.get("OLLAMA_BASE_URL", "http://localhost:11434")
         model = self.config.get("OLLAMA_MODEL", "llama3.2-vision")
         b64 = base64.b64encode(image_data).decode("ascii")
+        # Cap the context window. Vision models like qwen2.5vl default to
+        # 128k context, which makes Ollama allocate a 30+ GiB KV cache and
+        # fail to load on most consumer hardware. The shelf-scan prompt +
+        # image + response fit comfortably in 4k tokens, so we set num_ctx
+        # explicitly. Override via OLLAMA_NUM_CTX env / admin config.
+        num_ctx = int(self.config.get("OLLAMA_NUM_CTX", "4096"))
         body = {
             "model": model,
             "stream": False,
@@ -231,6 +237,7 @@ class AIService:
             "options": {
                 "temperature": float(self.config.get("AI_TEMPERATURE", "0.1")),
                 "num_predict": self.max_tokens,
+                "num_ctx": num_ctx,
             },
         }
         resp = requests.post(f"{base_url}/api/chat", json=body, timeout=self.timeout)
