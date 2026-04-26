@@ -21,6 +21,7 @@ from .genre_taxonomy_routes import genre_taxonomy_bp
 from .api_routes import api_bp
 from .series_routes import series_bp
 from .shelf_scan_routes import shelf_scan_bp, shelf_scan_admin_bp
+from .recommendation_routes import recommendations_bp
 
 # Create a main blueprint that can be registered with the app
 main_bp = Blueprint('main', __name__)
@@ -376,6 +377,7 @@ def register_blueprints(app):
     app.register_blueprint(genres_bp, url_prefix='/genres')
     app.register_blueprint(genres_bp, url_prefix='/categories', name='categories')
     app.register_blueprint(reading_logs, url_prefix='/reading-logs')
+    app.register_blueprint(recommendations_bp)
     # Register admin genre taxonomy routes
     app.register_blueprint(genre_taxonomy_bp, url_prefix='/admin/genre-taxonomy')
     app.register_blueprint(shelf_scan_bp)
@@ -391,5 +393,5 @@ def register_blueprints(app):
     # Or add URL rules to the main blueprint for backward compatibility
 
 # For backward compatibility, we can also export the blueprints
-__all__ = ['book_bp', 'people_bp', 'import_bp', 'genres_bp', 'main_bp', 'reading_logs', 'register_blueprints',
-           'shelf_scan_bp', 'shelf_scan_admin_bp']
+__all__ = ['book_bp', 'people_bp', 'import_bp', 'genres_bp', 'main_bp', 'reading_logs', 'recommendations_bp',
+           'register_blueprints', 'shelf_scan_bp', 'shelf_scan_admin_bp']

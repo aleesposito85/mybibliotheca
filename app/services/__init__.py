@@ -98,6 +98,16 @@ try:
             _reading_log_service = KuzuReadingLogService()
         return _reading_log_service
 
+    _recommendation_service = None
+
+    def _get_recommendation_service():
+        global _recommendation_service
+        if _recommendation_service is None:
+            _run_migration_once()
+            from .kuzu_recommendation_service import KuzuRecommendationService
+            _recommendation_service = KuzuRecommendationService()
+        return _recommendation_service
+
     def _get_opds_probe_service():
         """Lazy OPDS probe service."""
         global _opds_probe_service
@@ -145,6 +155,7 @@ try:
     import_mapping_service = _LazyService(_get_import_mapping_service)
     person_service = _LazyService(_get_person_service)
     reading_log_service = _LazyService(_get_reading_log_service)
+    recommendation_service = _LazyService(_get_recommendation_service)
     opds_probe_service = _LazyService(_get_opds_probe_service)
     opds_sync_service = _LazyService(_get_opds_sync_service)
     shelf_scan_service = _LazyService(_get_shelf_scan_service)
@@ -154,11 +165,11 @@ try:
         global _book_service, _user_service, _custom_field_service
         global _import_mapping_service, _person_service, _reading_log_service
         global _opds_probe_service, _opds_sync_service
-        global _shelf_scan_service
+        global _recommendation_service, _shelf_scan_service
         global book_service, user_service, custom_field_service
         global import_mapping_service, person_service, reading_log_service
         global opds_probe_service, opds_sync_service
-        global shelf_scan_service
+        global recommendation_service, shelf_scan_service
 
         # Clear global service instances
         _book_service = None
@@ -169,6 +180,7 @@ try:
         _reading_log_service = None
         _opds_probe_service = None
         _opds_sync_service = None
+        _recommendation_service = None
         _shelf_scan_service = None
 
         # Clear lazy service wrapper instances
@@ -178,6 +190,8 @@ try:
         import_mapping_service._service = None
         person_service._service = None
         reading_log_service._service = None
+        if hasattr(recommendation_service, "_service"):
+            recommendation_service._service = None  # type: ignore[attr-defined]
         if hasattr(opds_probe_service, "_service"):
             opds_probe_service._service = None  # type: ignore[attr-defined]
         if hasattr(opds_sync_service, "_service"):
@@ -192,6 +206,7 @@ try:
         import_mapping_service = _LazyService(_get_import_mapping_service)
         person_service = _LazyService(_get_person_service)
         reading_log_service = _LazyService(_get_reading_log_service)
+        recommendation_service = _LazyService(_get_recommendation_service)
         opds_probe_service = _LazyService(_get_opds_probe_service)
         opds_sync_service = _LazyService(_get_opds_sync_service)
         shelf_scan_service = _LazyService(_get_shelf_scan_service)
@@ -226,6 +241,7 @@ try:
         'reset_all_services',  # Service reset function
         # Stub services for compatibility
         'reading_log_service',
+        'recommendation_service',
         'direct_import_service',
         'job_service',
         'get_series_service',
