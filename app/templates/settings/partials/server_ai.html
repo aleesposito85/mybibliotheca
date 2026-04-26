@@ -23,12 +23,27 @@
           </div>
           <div class="col-md-6">
             <label class="form-label">Model</label>
-            <select class="form-select" name="openai_model" id="openai_model">
-              <option value="gpt-4o-mini" {{ 'selected' if ai_config and ai_config.get('OPENAI_MODEL') == 'gpt-4o-mini' else '' }}>GPT-4o Mini (Recommended)</option>
-              <option value="gpt-4o" {{ 'selected' if ai_config and ai_config.get('OPENAI_MODEL') == 'gpt-4o' else '' }}>GPT-4o</option>
-              <option value="gpt-4-turbo" {{ 'selected' if ai_config and ai_config.get('OPENAI_MODEL') == 'gpt-4-turbo' else '' }}>GPT-4 Turbo</option>
-              <option value="gpt-4" {{ 'selected' if ai_config and ai_config.get('OPENAI_MODEL') == 'gpt-4' else '' }}>GPT-4</option>
+            {# The dropdown lists common OpenAI models. For OpenAI-compatible
+               proxies (Ollama Cloud, LiteLLM, vLLM, custom gateways) the
+               actual model name often differs — toggle "Enter manually" and
+               type any model id. #}
+            {% set _openai_model = ai_config.get('OPENAI_MODEL','') if ai_config else '' %}
+            {% set _openai_known = _openai_model in ('gpt-4o-mini','gpt-4o','gpt-4-turbo','gpt-4') %}
+            <select class="form-select" name="openai_model" id="openai_model" {% if _openai_model and not _openai_known %}style="display:none;"{% endif %}>
+              <option value="gpt-4o-mini" {{ 'selected' if _openai_model == 'gpt-4o-mini' else '' }}>GPT-4o Mini (Recommended)</option>
+              <option value="gpt-4o" {{ 'selected' if _openai_model == 'gpt-4o' else '' }}>GPT-4o</option>
+              <option value="gpt-4-turbo" {{ 'selected' if _openai_model == 'gpt-4-turbo' else '' }}>GPT-4 Turbo</option>
+              <option value="gpt-4" {{ 'selected' if _openai_model == 'gpt-4' else '' }}>GPT-4</option>
             </select>
+            <div class="form-check mt-2">
+              <input class="form-check-input" type="checkbox" id="openai_manual_model"
+                     {% if _openai_model and not _openai_known %}checked{% endif %} />
+              <label class="form-check-label" for="openai_manual_model">Enter model manually</label>
+            </div>
+            <input type="text" class="form-control mt-2" id="openai_model_manual" name="openai_model_manual"
+                   placeholder="e.g. qwen3-vl:235b-instruct"
+                   value="{{ _openai_model if (_openai_model and not _openai_known) else '' }}"
+                   style="{% if not _openai_model or _openai_known %}display:none;{% endif %}" />
           </div>
           <div class="col-12">
             <label class="form-label">Base URL</label>

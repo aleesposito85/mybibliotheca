@@ -2141,7 +2141,6 @@ def save_ai_settings():
             'AI_PROVIDER': request.form.get('ai_provider', 'openai'),
             'OPENAI_API_KEY': request.form.get('openai_api_key', ''),
             'OPENAI_BASE_URL': request.form.get('openai_base_url', 'https://api.openai.com/v1'),
-            'OPENAI_MODEL': request.form.get('openai_model', 'gpt-4o'),
             'OLLAMA_BASE_URL': request.form.get('ollama_base_url', 'http://localhost:11434/v1'),
             'AI_TIMEOUT': request.form.get('ai_timeout', '30'),
             'AI_MAX_TOKENS': request.form.get('ai_max_tokens', '1000'),
@@ -2149,9 +2148,16 @@ def save_ai_settings():
             'AI_BOOK_EXTRACTION_ENABLED': 'true' if request.form.get('ai_book_extraction_enabled') else 'false',
             'AI_BOOK_EXTRACTION_AUTO_SEARCH': 'true' if request.form.get('ai_book_extraction_auto_search') else 'false',
         }
+        # Manual-entry overrides for both Ollama and OpenAI-compatible
+        # endpoints (Ollama Cloud, LiteLLM, vLLM, custom gateways often use
+        # model ids that aren't in the canned dropdown).
         ollama_manual = (request.form.get('ollama_model_manual') or '').strip()
         ollama_selected = (request.form.get('ollama_model') or '').strip()
         config['OLLAMA_MODEL'] = ollama_manual or ollama_selected or 'llama3.2-vision:11b'
+
+        openai_manual = (request.form.get('openai_model_manual') or '').strip()
+        openai_selected = (request.form.get('openai_model') or '').strip()
+        config['OPENAI_MODEL'] = openai_manual or openai_selected or 'gpt-4o'
 
         if save_ai_config(config):
             flash('AI settings saved successfully!', 'success')
@@ -2183,7 +2189,7 @@ def test_ai_connection():
             'AI_PROVIDER': request.form.get('ai_provider', 'openai'),
             'OPENAI_API_KEY': request.form.get('openai_api_key', ''),
             'OPENAI_BASE_URL': request.form.get('openai_base_url', 'https://api.openai.com/v1'),
-            'OPENAI_MODEL': request.form.get('openai_model', 'gpt-4o'),
+            'OPENAI_MODEL': request.form.get('openai_model_manual') or request.form.get('openai_model', 'gpt-4o'),
             'OLLAMA_BASE_URL': request.form.get('ollama_base_url', 'http://localhost:11434/v1'),
             'OLLAMA_MODEL': request.form.get('ollama_model_manual') or request.form.get('ollama_model', 'llama3.2-vision:11b'),
             'AI_TIMEOUT': request.form.get('ai_timeout', '30'),

@@ -1258,6 +1258,14 @@ document.addEventListener('DOMContentLoaded', () => {
                                         if(manual){ manual.style.display = manualChk.checked ? 'block':'none'; }
                                         if(select){ select.style.display = manualChk.checked ? 'none':'block'; }
                                     }); }
+                                    // Same toggle for the OpenAI / OpenAI-compatible model field.
+                                    const openaiManualChk = document.getElementById('openai_manual_model');
+                                    if(openaiManualChk){ openaiManualChk.addEventListener('change', ()=>{
+                                        const manual = document.getElementById('openai_model_manual');
+                                        const select = document.getElementById('openai_model');
+                                        if(manual){ manual.style.display = openaiManualChk.checked ? 'block':'none'; }
+                                        if(select){ select.style.display = openaiManualChk.checked ? 'none':'block'; }
+                                    }); }
                                     const maxTokens = document.getElementById('ai_max_tokens');
                                     const warn = document.getElementById('ai-max-tokens-warning');
                                     if(maxTokens && warn){ const toggle=()=>{ warn.style.display = parseInt(maxTokens.value||'0',10) > 16000 ? 'block':'none'; }; maxTokens.addEventListener('input', toggle); toggle(); }

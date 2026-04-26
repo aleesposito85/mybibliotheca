@@ -1296,9 +1296,8 @@ def update_ai_settings():
         config['AI_PROVIDER'] = request.form.get('ai_provider', 'openai')
         config['OPENAI_API_KEY'] = request.form.get('openai_api_key', '')
         config['OPENAI_BASE_URL'] = request.form.get('openai_base_url', 'https://api.openai.com/v1')
-        config['OPENAI_MODEL'] = request.form.get('openai_model', 'gpt-4o')
         config['OLLAMA_BASE_URL'] = request.form.get('ollama_base_url', 'http://localhost:11434/v1')
-        
+
         # Handle Ollama model selection (dropdown vs manual input)
         ollama_model_manual = request.form.get('ollama_model_manual', '').strip()
         ollama_model_select = request.form.get('ollama_model', '').strip()
@@ -1308,6 +1307,17 @@ def update_ai_settings():
             config['OLLAMA_MODEL'] = ollama_model_select
         else:
             config['OLLAMA_MODEL'] = 'llama3.2-vision:11b'  # fallback
+
+        # Same dropdown-vs-manual handling for OpenAI-compatible endpoints
+        # (Ollama Cloud, LiteLLM, vLLM proxies typically need a custom id).
+        openai_model_manual = request.form.get('openai_model_manual', '').strip()
+        openai_model_select = request.form.get('openai_model', '').strip()
+        if openai_model_manual:
+            config['OPENAI_MODEL'] = openai_model_manual
+        elif openai_model_select:
+            config['OPENAI_MODEL'] = openai_model_select
+        else:
+            config['OPENAI_MODEL'] = 'gpt-4o'  # fallback
             
         config['AI_TIMEOUT'] = request.form.get('ai_timeout', '30')
         config['AI_MAX_TOKENS'] = request.form.get('ai_max_tokens', '1000')
@@ -1609,14 +1619,14 @@ def test_ai_connection():
             'AI_PROVIDER': request.form.get('ai_provider', 'openai'),
             'OPENAI_API_KEY': request.form.get('openai_api_key', ''),
             'OPENAI_BASE_URL': request.form.get('openai_base_url', 'https://api.openai.com/v1'),
-            'OPENAI_MODEL': request.form.get('openai_model', 'gpt-4o'),
+            'OPENAI_MODEL': request.form.get('openai_model_manual') or request.form.get('openai_model', 'gpt-4o'),
             'OLLAMA_BASE_URL': request.form.get('ollama_base_url', 'http://localhost:11434/v1'),
             'OLLAMA_MODEL': request.form.get('ollama_model_manual') or request.form.get('ollama_model', 'llama3.2-vision:11b'),
             'AI_TIMEOUT': request.form.get('ai_timeout', '30'),
             'AI_MAX_TOKENS': request.form.get('ai_max_tokens', '1000'),
             'AI_TEMPERATURE': request.form.get('ai_temperature', '0.1'),
         }
-        
+
         # Test connection using AI service
         from app.services.ai_service import AIService
         ai_service = AIService(config)
